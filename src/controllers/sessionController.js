@@ -1,5 +1,176 @@
 const db = require("../config/db");
 
+function calculateAmountFromBreakdown({
+  white_count = 0,
+  red_count = 0,
+  blue_count = 0,
+  green_count = 0,
+  black_count = 0,
+}) {
+  return (
+    Number(white_count) * 1 +
+    Number(red_count) * 5 +
+    Number(blue_count) * 10 +
+    Number(green_count) * 25 +
+    Number(black_count) * 50
+  );
+}
+
+function normalizeAmount({
+  amount_mode,
+  amount_total,
+  white_count = 0,
+  red_count = 0,
+  blue_count = 0,
+  green_count = 0,
+  black_count = 0,
+}) {
+  if (amount_mode === "TOTAL_AMOUNT") {
+    if (
+      amount_total === undefined ||
+      amount_total === null ||
+      Number.isNaN(Number(amount_total)) ||
+      Number(amount_total) < 0
+    ) {
+      throw new Error("Invalid amount_total");
+    }
+
+    return Number(amount_total);
+  }
+
+  if (amount_mode === "CHIP_BREAKDOWN") {
+    return calculateAmountFromBreakdown({
+      white_count,
+      red_count,
+      blue_count,
+      green_count,
+      black_count,
+    });
+  }
+
+  throw new Error("Invalid amount_mode");
+}
+
+async function getUserBalance(connection, userId) {
+  const [rows] = await connection.execute(
+    `
+    SELECT
+      COALESCE(SUM(
+        CASE
+          WHEN direction = 'CREDIT' THEN amount
+          WHEN direction = 'DEBIT' THEN -amount
+          ELSE 0
+        END
+      ), 0) AS balance
+    FROM balance_transactions
+    WHERE user_id = ?
+    `,
+    [userId],
+  );
+
+  return Number(rows[0].balance);
+}
+
+async function insertApprovedConversionRequest(connection, data) {
+  const [result] = await connection.execute(
+    `
+    INSERT INTO conversion_requests
+    (
+      user_id,
+      session_id,
+      type,
+      amount_mode,
+      amount_total,
+      white_count,
+      red_count,
+      blue_count,
+      green_count,
+      black_count,
+      status,
+      admin_user_id,
+      admin_decision_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, NOW())
+    `,
+    [
+      data.user_id,
+      data.session_id,
+      data.type,
+      data.amount_mode,
+      data.amount_total,
+      Number(data.white_count || 0),
+      Number(data.red_count || 0),
+      Number(data.blue_count || 0),
+      Number(data.green_count || 0),
+      Number(data.black_count || 0),
+      data.admin_user_id,
+    ],
+  );
+
+  return result.insertId;
+}
+
+async function insertTransaction(connection, data) {
+  await connection.execute(
+    `
+    INSERT INTO balance_transactions
+    (
+      user_id,
+      created_by_user_id,
+      session_id,
+      type,
+      direction,
+      amount,
+      from_unit,
+      to_unit,
+      note
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    [
+      data.user_id,
+      data.created_by_user_id,
+      data.session_id,
+      data.type,
+      data.direction,
+      data.amount,
+      data.from_unit,
+      data.to_unit,
+      data.note,
+    ],
+  );
+}
+
+async function upsertSessionPlayerPlaying(connection, sessionId, userId) {
+  await connection.execute(
+    `
+    INSERT INTO session_players (session_id, user_id, is_playing, left_at)
+    VALUES (?, ?, TRUE, NULL)
+    ON DUPLICATE KEY UPDATE
+      is_playing = TRUE,
+      left_at = NULL
+    `,
+    [sessionId, userId],
+  );
+}
+
+async function getPendingCashout(connection, sessionId, userId) {
+  const [rows] = await connection.execute(
+    `
+    SELECT id
+    FROM conversion_requests
+    WHERE session_id = ?
+      AND user_id = ?
+      AND type = 'TO_COINS'
+      AND status = 'PENDING'
+    LIMIT 1
+    `,
+    [sessionId, userId],
+  );
+
+  return rows[0] || null;
+}
+
 async function getActiveSession(req, res) {
   try {
     const [sessionRows] = await db.execute(
@@ -93,10 +264,41 @@ async function startSession(req, res) {
 
   try {
     const adminUserId = req.user.id;
-    const { title } = req.body;
+    const {
+      title,
+      amount_mode = "TOTAL_AMOUNT",
+      amount_total,
+      white_count = 0,
+      red_count = 0,
+      blue_count = 0,
+      green_count = 0,
+      black_count = 0,
+    } = req.body;
 
     if (!title || !title.trim()) {
       return res.status(400).json({ message: "Title is required" });
+    }
+
+    let buyInAmount;
+
+    try {
+      buyInAmount = normalizeAmount({
+        amount_mode,
+        amount_total,
+        white_count,
+        red_count,
+        blue_count,
+        green_count,
+        black_count,
+      });
+    } catch (error) {
+      return res.status(400).json({ message: error.message || "Invalid amount" });
+    }
+
+    if (buyInAmount <= 0) {
+      return res.status(400).json({
+        message: "Admin buy-in must be greater than 0",
+      });
     }
 
     await connection.beginTransaction();
@@ -118,6 +320,13 @@ async function startSession(req, res) {
         .json({ message: "There is already an active session" });
     }
 
+    const adminBalance = await getUserBalance(connection, adminUserId);
+
+    if (adminBalance < buyInAmount) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Admin does not have enough balance" });
+    }
+
     const [result] = await connection.execute(
       `
       INSERT INTO game_sessions (title, status, started_by_user_id)
@@ -128,22 +337,40 @@ async function startSession(req, res) {
 
     const sessionId = result.insertId;
 
-    await connection.execute(
-      `
-      INSERT INTO session_players (session_id, user_id, is_playing, left_at)
-      VALUES (?, ?, TRUE, NULL)
-      ON DUPLICATE KEY UPDATE
-        is_playing = TRUE,
-        left_at = NULL
-      `,
-      [sessionId, adminUserId],
-    );
+    await upsertSessionPlayerPlaying(connection, sessionId, adminUserId);
+
+    await insertApprovedConversionRequest(connection, {
+      user_id: adminUserId,
+      session_id: sessionId,
+      type: "TO_CHIPS",
+      amount_mode,
+      amount_total: buyInAmount,
+      white_count,
+      red_count,
+      blue_count,
+      green_count,
+      black_count,
+      admin_user_id: adminUserId,
+    });
+
+    await insertTransaction(connection, {
+      user_id: adminUserId,
+      created_by_user_id: adminUserId,
+      session_id: sessionId,
+      type: "CONVERSION_TO_CHIPS",
+      direction: "DEBIT",
+      amount: buyInAmount,
+      from_unit: "DOUBLE_O",
+      to_unit: "CHIPS",
+      note: "Admin opening session buy-in",
+    });
 
     await connection.commit();
 
     res.status(201).json({
       message: "Session started successfully",
       sessionId,
+      adminBuyInAmount: buyInAmount,
     });
   } catch (error) {
     await connection.rollback();
@@ -159,7 +386,31 @@ async function endActiveSession(req, res) {
 
   try {
     const adminUserId = req.user.id;
-    const force = !!req.body.force;
+    const {
+      amount_mode = "TOTAL_AMOUNT",
+      amount_total,
+      white_count = 0,
+      red_count = 0,
+      blue_count = 0,
+      green_count = 0,
+      black_count = 0,
+    } = req.body;
+
+    let adminCashoutAmount;
+
+    try {
+      adminCashoutAmount = normalizeAmount({
+        amount_mode,
+        amount_total,
+        white_count,
+        red_count,
+        blue_count,
+        green_count,
+        black_count,
+      });
+    } catch (error) {
+      return res.status(400).json({ message: error.message || "Invalid amount" });
+    }
 
     await connection.beginTransaction();
 
@@ -186,69 +437,76 @@ async function endActiveSession(req, res) {
       FROM session_players sp
       JOIN users u ON u.id = sp.user_id
       WHERE sp.session_id = ? AND sp.is_playing = TRUE AND sp.user_id <> ?
+      ORDER BY u.username ASC
       `,
       [sessionId, adminUserId],
     );
 
-    if (activePlayers.length > 0 && !force) {
-      await connection.rollback();
-      return res.status(409).json({
-        message: "There are still active players at the table",
-        requiresConfirmation: true,
-        activePlayers: activePlayers.map((p) => p.username),
-      });
-    }
+    let forcedZeroCashOutCount = 0;
+    let preservedPendingCashOutCount = 0;
 
-    if (activePlayers.length > 0 && force) {
-      for (const player of activePlayers) {
-        await connection.execute(
-          `
-          INSERT INTO conversion_requests
-          (
-            user_id,
-            session_id,
-            type,
-            amount_mode,
-            amount_total,
-            white_count,
-            red_count,
-            blue_count,
-            green_count,
-            black_count,
-            status,
-            admin_user_id,
-            admin_decision_at
-          )
-          VALUES (?, ?, 'TO_COINS', 'TOTAL_AMOUNT', 0, 0, 0, 0, 0, 0, 'APPROVED', ?, NOW())
-          `,
-          [player.user_id, sessionId, adminUserId],
-        );
+    for (const player of activePlayers) {
+      const pendingCashout = await getPendingCashout(connection, sessionId, player.user_id);
 
-        await connection.execute(
-          `
-          INSERT INTO balance_transactions
-          (
-            user_id,
-            created_by_user_id,
-            session_id,
-            type,
-            direction,
-            amount,
-            from_unit,
-            to_unit,
-            note
-          )
-          VALUES (?, ?, ?, 'CONVERSION_TO_COINS', 'CREDIT', 0, 'CHIPS', 'DOUBLE_O', ?)
-          `,
-          [
-            player.user_id,
-            adminUserId,
-            sessionId,
-            "Forced cash out with 0 on session end",
-          ],
-        );
+      if (pendingCashout) {
+        preservedPendingCashOutCount += 1;
+        continue;
       }
+
+      await insertApprovedConversionRequest(connection, {
+        user_id: player.user_id,
+        session_id: sessionId,
+        type: "TO_COINS",
+        amount_mode: "TOTAL_AMOUNT",
+        amount_total: 0,
+        white_count: 0,
+        red_count: 0,
+        blue_count: 0,
+        green_count: 0,
+        black_count: 0,
+        admin_user_id: adminUserId,
+      });
+
+      await insertTransaction(connection, {
+        user_id: player.user_id,
+        created_by_user_id: adminUserId,
+        session_id: sessionId,
+        type: "CONVERSION_TO_COINS",
+        direction: "CREDIT",
+        amount: 0,
+        from_unit: "CHIPS",
+        to_unit: "DOUBLE_O",
+        note: "Automatic zero cash out on session end",
+      });
+
+      forcedZeroCashOutCount += 1;
     }
+
+    await insertApprovedConversionRequest(connection, {
+      user_id: adminUserId,
+      session_id: sessionId,
+      type: "TO_COINS",
+      amount_mode,
+      amount_total: adminCashoutAmount,
+      white_count,
+      red_count,
+      blue_count,
+      green_count,
+      black_count,
+      admin_user_id: adminUserId,
+    });
+
+    await insertTransaction(connection, {
+      user_id: adminUserId,
+      created_by_user_id: adminUserId,
+      session_id: sessionId,
+      type: "CONVERSION_TO_COINS",
+      direction: "CREDIT",
+      amount: adminCashoutAmount,
+      from_unit: "CHIPS",
+      to_unit: "DOUBLE_O",
+      note: "Admin session close cash out",
+    });
 
     await connection.execute(
       `
@@ -277,7 +535,9 @@ async function endActiveSession(req, res) {
 
     res.json({
       message: "Session ended successfully",
-      forcedCashOutCount: activePlayers.length,
+      forcedZeroCashOutCount,
+      preservedPendingCashOutCount,
+      adminCashOutAmount: adminCashoutAmount,
     });
   } catch (error) {
     await connection.rollback();

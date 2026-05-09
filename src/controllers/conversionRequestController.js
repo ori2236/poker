@@ -16,10 +16,45 @@ function calculateAmountFromBreakdown({
   );
 }
 
+function normalizeAmount({
+  amount_mode,
+  amount_total,
+  white_count = 0,
+  red_count = 0,
+  blue_count = 0,
+  green_count = 0,
+  black_count = 0,
+}) {
+  if (amount_mode === "TOTAL_AMOUNT") {
+    if (
+      amount_total === undefined ||
+      amount_total === null ||
+      Number.isNaN(Number(amount_total)) ||
+      Number(amount_total) < 0
+    ) {
+      throw new Error("Invalid amount_total");
+    }
+
+    return Number(amount_total);
+  }
+
+  if (amount_mode === "CHIP_BREAKDOWN") {
+    return calculateAmountFromBreakdown({
+      white_count,
+      red_count,
+      blue_count,
+      green_count,
+      black_count,
+    });
+  }
+
+  throw new Error("Invalid amount_mode");
+}
+
 async function getUserBalance(connection, userId) {
   const [rows] = await connection.execute(
     `
-    SELECT 
+    SELECT
       COALESCE(SUM(
         CASE
           WHEN direction = 'CREDIT' THEN amount
@@ -63,13 +98,44 @@ async function getSessionPlayer(connection, sessionId, userId) {
   return rows[0] || null;
 }
 
-async function getPendingRequestForUser(connection, userId) {
+async function getPendingRequestForUser(connection, userId, options = {}) {
+  const conditions = ["user_id = ?", "status = 'PENDING'"];
+  const params = [userId];
+
+  if (options.sessionId !== undefined) {
+    if (options.sessionId === null) {
+      conditions.push("session_id IS NULL");
+    } else {
+      conditions.push("session_id = ?");
+      params.push(options.sessionId);
+    }
+  }
+
+  if (options.type) {
+    conditions.push("type = ?");
+    params.push(options.type);
+  }
+
   const [rows] = await connection.execute(
     `
     SELECT *
     FROM conversion_requests
-    WHERE user_id = ? AND status = 'PENDING'
+    WHERE ${conditions.join(" AND ")}
     ORDER BY id DESC
+    LIMIT 1
+    `,
+    params,
+  );
+
+  return rows[0] || null;
+}
+
+async function getUserById(connection, userId) {
+  const [rows] = await connection.execute(
+    `
+    SELECT id, username, role, is_active
+    FROM users
+    WHERE id = ?
     LIMIT 1
     `,
     [userId],
@@ -109,11 +175,35 @@ async function insertTransaction(connection, data) {
   );
 }
 
+async function upsertSessionPlayerPlaying(connection, sessionId, userId) {
+  await connection.execute(
+    `
+    INSERT INTO session_players (session_id, user_id, is_playing, left_at)
+    VALUES (?, ?, TRUE, NULL)
+    ON DUPLICATE KEY UPDATE
+      is_playing = TRUE,
+      left_at = NULL
+    `,
+    [sessionId, userId],
+  );
+}
+
+async function markSessionPlayerOut(connection, sessionId, userId) {
+  await connection.execute(
+    `
+    UPDATE session_players
+    SET is_playing = FALSE, left_at = NOW()
+    WHERE session_id = ? AND user_id = ?
+    `,
+    [sessionId, userId],
+  );
+}
+
 async function createConversionRequest(req, res) {
   const connection = await db.getConnection();
 
   try {
-    const userId = req.user.id;
+    const actorUserId = req.user.id;
     const isAdmin = req.user.role === "ADMIN";
 
     const {
@@ -125,6 +215,7 @@ async function createConversionRequest(req, res) {
       blue_count = 0,
       green_count = 0,
       black_count = 0,
+      target_user_id,
     } = req.body;
 
     if (!type || !amount_mode) {
@@ -142,13 +233,30 @@ async function createConversionRequest(req, res) {
     await connection.beginTransaction();
 
     const activeSession = await getActiveSession(connection);
-    const pendingRequest = await getPendingRequestForUser(connection, userId);
+    const sessionId = activeSession ? activeSession.id : null;
+    const targetUserId = isAdmin && target_user_id ? Number(target_user_id) : actorUserId;
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Invalid target_user_id" });
+    }
+
+    const targetUser = await getUserById(connection, targetUserId);
+
+    if (!targetUser || Number(targetUser.is_active) !== 1) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Target user not found" });
+    }
+
+    const pendingRequest = await getPendingRequestForUser(connection, targetUserId);
 
     if (pendingRequest) {
       await connection.rollback();
       return res.status(400).json({
         message:
-          "You already have a pending request waiting for admin approval",
+          targetUserId === actorUserId
+            ? "You already have a pending request waiting for admin approval"
+            : "This user already has a pending request waiting for admin approval",
       });
     }
 
@@ -159,32 +267,21 @@ async function createConversionRequest(req, res) {
       });
     }
 
-    let finalAmount = null;
+    let finalAmount;
 
-    if (amount_mode === "TOTAL_AMOUNT") {
-      if (
-        amount_total === undefined ||
-        amount_total === null ||
-        Number(amount_total) < 0
-      ) {
-        await connection.rollback();
-        return res.status(400).json({ message: "Invalid amount_total" });
-      }
-
-      finalAmount = Number(amount_total);
-    } else {
-      finalAmount = calculateAmountFromBreakdown({
+    try {
+      finalAmount = normalizeAmount({
+        amount_mode,
+        amount_total,
         white_count,
         red_count,
         blue_count,
         green_count,
         black_count,
       });
-
-      if (finalAmount < 0) {
-        await connection.rollback();
-        return res.status(400).json({ message: "Invalid chip breakdown" });
-      }
+    } catch (error) {
+      await connection.rollback();
+      return res.status(400).json({ message: error.message || "Invalid amount" });
     }
 
     if (type === "TO_CHIPS" && finalAmount <= 0) {
@@ -194,9 +291,8 @@ async function createConversionRequest(req, res) {
       });
     }
 
-    const sessionId = activeSession ? activeSession.id : null;
     const player = sessionId
-      ? await getSessionPlayer(connection, sessionId, userId)
+      ? await getSessionPlayer(connection, sessionId, targetUserId)
       : null;
     const isPlaying = !!(player && Number(player.is_playing) === 1);
 
@@ -218,11 +314,16 @@ async function createConversionRequest(req, res) {
     }
 
     if (type === "TO_CHIPS") {
-      const userBalance = await getUserBalance(connection, userId);
+      const userBalance = await getUserBalance(connection, targetUserId);
 
       if (userBalance < finalAmount) {
         await connection.rollback();
-        return res.status(400).json({ message: "Not enough balance" });
+        return res.status(400).json({
+          message:
+            targetUserId === actorUserId
+              ? "Not enough balance"
+              : "Selected user does not have enough balance",
+        });
       }
     }
 
@@ -248,7 +349,7 @@ async function createConversionRequest(req, res) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, NOW())
         `,
         [
-          userId,
+          targetUserId,
           sessionId,
           type,
           amount_mode,
@@ -258,7 +359,7 @@ async function createConversionRequest(req, res) {
           Number(blue_count),
           Number(green_count),
           Number(black_count),
-          userId,
+          actorUserId,
         ],
       );
 
@@ -273,18 +374,18 @@ async function createConversionRequest(req, res) {
         fromUnit = "DOUBLE_O";
         toUnit = "CHIPS";
         transactionType = "CONVERSION_TO_CHIPS";
-        note = "Admin direct conversion from Double O to chips";
+        note = `Admin direct buy-in for ${targetUser.username}`;
       } else {
         direction = "CREDIT";
         fromUnit = "CHIPS";
         toUnit = "DOUBLE_O";
         transactionType = "CONVERSION_TO_COINS";
-        note = "Admin direct conversion from chips to Double O";
+        note = `Admin direct cash out for ${targetUser.username}`;
       }
 
       await insertTransaction(connection, {
-        user_id: userId,
-        created_by_user_id: userId,
+        user_id: targetUserId,
+        created_by_user_id: actorUserId,
         session_id: sessionId,
         type: transactionType,
         direction,
@@ -296,25 +397,9 @@ async function createConversionRequest(req, res) {
 
       if (sessionId) {
         if (type === "TO_CHIPS") {
-          await connection.execute(
-            `
-            INSERT INTO session_players (session_id, user_id, is_playing, left_at)
-            VALUES (?, ?, TRUE, NULL)
-            ON DUPLICATE KEY UPDATE
-              is_playing = TRUE,
-              left_at = NULL
-            `,
-            [sessionId, userId],
-          );
+          await upsertSessionPlayerPlaying(connection, sessionId, targetUserId);
         } else {
-          await connection.execute(
-            `
-            UPDATE session_players
-            SET is_playing = FALSE, left_at = NOW()
-            WHERE session_id = ? AND user_id = ?
-            `,
-            [sessionId, userId],
-          );
+          await markSessionPlayerOut(connection, sessionId, targetUserId);
         }
       }
 
@@ -347,7 +432,7 @@ async function createConversionRequest(req, res) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
       `,
       [
-        userId,
+        actorUserId,
         sessionId,
         type,
         amount_mode,
@@ -385,23 +470,29 @@ async function getConversionRequestsFeed(req, res) {
     const scope = req.query.scope === "all" ? "all" : "mine";
     const status = String(req.query.status || "all").toUpperCase();
 
-    const params = [];
-    const conditions = [];
+    const requestParams = [];
+    const requestConditions = [];
+    const bonusParams = [];
+    const bonusConditions = ["bt.type IN ('WELCOME_BONUS', 'BONUS')"];
 
     if (scope === "mine") {
-      conditions.push("cr.user_id = ?");
-      params.push(req.user.id);
+      requestConditions.push("cr.user_id = ?");
+      requestParams.push(req.user.id);
+      bonusConditions.push("bt.user_id = ?");
+      bonusParams.push(req.user.id);
     }
 
     if (["PENDING", "APPROVED", "REJECTED"].includes(status)) {
-      conditions.push("cr.status = ?");
-      params.push(status);
+      requestConditions.push("cr.status = ?");
+      requestParams.push(status);
     }
 
-    const whereClause =
-      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const requestWhereClause =
+      requestConditions.length > 0
+        ? `WHERE ${requestConditions.join(" AND ")}`
+        : "";
 
-    const [rows] = await db.execute(
+    const [requestRows] = await db.execute(
       `
       SELECT
         cr.id,
@@ -409,28 +500,98 @@ async function getConversionRequestsFeed(req, res) {
         u.username,
         cr.session_id,
         cr.type,
-        cr.amount_mode,
         cr.amount_total,
-        cr.white_count,
-        cr.red_count,
-        cr.blue_count,
-        cr.green_count,
-        cr.black_count,
         cr.status,
+        cr.created_at,
+        cr.admin_decision_at,
         cr.admin_user_id,
         au.username AS admin_username,
-        cr.admin_decision_at,
-        cr.created_at
+        'REQUEST' AS source_kind
       FROM conversion_requests cr
       JOIN users u ON u.id = cr.user_id
       LEFT JOIN users au ON au.id = cr.admin_user_id
-      ${whereClause}
+      ${requestWhereClause}
       ORDER BY cr.created_at DESC, cr.id DESC
       `,
-      params,
+      requestParams,
     );
 
-    res.json(rows);
+    let bonusRows = [];
+
+    if (status === "ALL") {
+      const bonusWhereClause = `WHERE ${bonusConditions.join(" AND ")}`;
+
+      const [rows] = await db.execute(
+        `
+        SELECT
+          bt.id,
+          bt.user_id,
+          u.username,
+          bt.session_id,
+          bt.amount,
+          bt.note,
+          bt.created_at,
+          'BONUS' AS source_kind
+        FROM balance_transactions bt
+        JOIN users u ON u.id = bt.user_id
+        ${bonusWhereClause}
+        ORDER BY bt.created_at DESC, bt.id DESC
+        `,
+        bonusParams,
+      );
+
+      bonusRows = rows;
+    }
+
+    const normalizedRequests = requestRows.map((row) => ({
+      id: `request-${row.id}`,
+      raw_id: Number(row.id),
+      source_kind: row.source_kind,
+      action_type: row.type === "TO_CHIPS" ? "BUY_IN" : "CASH_OUT",
+      user_id: Number(row.user_id),
+      username: row.username,
+      session_id: row.session_id === null ? null : Number(row.session_id),
+      amount: Number(row.amount_total),
+      status: row.status,
+      note:
+        row.type === "TO_CHIPS"
+          ? "Conversion request to chips"
+          : "Conversion request to Double O",
+      created_at: row.created_at,
+      admin_decision_at: row.admin_decision_at,
+      admin_user_id: row.admin_user_id === null ? null : Number(row.admin_user_id),
+      admin_username: row.admin_username || null,
+    }));
+
+    const normalizedBonuses = bonusRows.map((row) => ({
+      id: `bonus-${row.id}`,
+      raw_id: Number(row.id),
+      source_kind: row.source_kind,
+      action_type: "BONUS",
+      user_id: Number(row.user_id),
+      username: row.username,
+      session_id: row.session_id === null ? null : Number(row.session_id),
+      amount: Number(row.amount),
+      status: "APPROVED",
+      note: row.note || "Bonus",
+      created_at: row.created_at,
+      admin_decision_at: null,
+      admin_user_id: null,
+      admin_username: null,
+    }));
+
+    const merged = [...normalizedRequests, ...normalizedBonuses].sort((a, b) => {
+      const aTime = new Date(a.created_at).getTime();
+      const bTime = new Date(b.created_at).getTime();
+
+      if (bTime !== aTime) {
+        return bTime - aTime;
+      }
+
+      return String(b.id).localeCompare(String(a.id));
+    });
+
+    res.json(merged);
   } catch (error) {
     console.error("getConversionRequestsFeed error:", error);
     res.status(500).json({ message: "Server error" });
@@ -525,16 +686,7 @@ async function approveConversionRequest(req, res) {
       });
 
       if (request.session_id) {
-        await connection.execute(
-          `
-          INSERT INTO session_players (session_id, user_id, is_playing, left_at)
-          VALUES (?, ?, TRUE, NULL)
-          ON DUPLICATE KEY UPDATE
-            is_playing = TRUE,
-            left_at = NULL
-          `,
-          [request.session_id, request.user_id],
-        );
+        await upsertSessionPlayerPlaying(connection, request.session_id, request.user_id);
       }
     } else {
       await insertTransaction(connection, {
@@ -550,14 +702,7 @@ async function approveConversionRequest(req, res) {
       });
 
       if (request.session_id) {
-        await connection.execute(
-          `
-          UPDATE session_players
-          SET is_playing = FALSE, left_at = NOW()
-          WHERE session_id = ? AND user_id = ?
-          `,
-          [request.session_id, request.user_id],
-        );
+        await markSessionPlayerOut(connection, request.session_id, request.user_id);
       }
     }
 
