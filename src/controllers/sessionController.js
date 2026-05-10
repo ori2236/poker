@@ -197,31 +197,89 @@ async function getActiveSession(req, res) {
         sp.user_id,
         u.username,
         u.profile_image_base64,
-        sp.joined_at,
-        sp.left_at,
-        sp.is_playing
+        COALESCE((
+          SELECT SUM(cr1.amount_total)
+          FROM conversion_requests cr1
+          WHERE cr1.session_id = sp.session_id
+            AND cr1.user_id = sp.user_id
+            AND cr1.status = 'APPROVED'
+            AND cr1.type = 'TO_CHIPS'
+        ), 0) AS buy_in_total,
+        COALESCE((
+          SELECT SUM(CASE
+            WHEN cr2.type = 'TO_CHIPS' THEN cr2.amount_total
+            WHEN cr2.type = 'TO_COINS' THEN -cr2.amount_total
+            ELSE 0
+          END)
+          FROM conversion_requests cr2
+          WHERE cr2.session_id = sp.session_id
+            AND cr2.user_id = sp.user_id
+            AND cr2.status = 'APPROVED'
+        ), 0) AS stack_amount
       FROM session_players sp
       JOIN users u ON u.id = sp.user_id
       WHERE sp.session_id = ?
-      ORDER BY sp.is_playing DESC, u.username ASC
+        AND sp.is_playing = TRUE
+        AND NOT EXISTS (
+          SELECT 1
+          FROM conversion_requests cr_pending
+          WHERE cr_pending.session_id = sp.session_id
+            AND cr_pending.user_id = sp.user_id
+            AND cr_pending.type = 'TO_COINS'
+            AND cr_pending.status = 'PENDING'
+        )
+      ORDER BY stack_amount DESC, buy_in_total DESC, u.username ASC
       `,
       [session.id],
     );
 
-    const [pendingRequests] = await db.execute(
+    const [waitingBuyIns] = await db.execute(
       `
       SELECT
         cr.id,
         cr.user_id,
         u.username,
-        cr.type,
+        u.profile_image_base64,
         cr.amount_mode,
         cr.amount_total,
         cr.status,
-        cr.created_at
+        cr.created_at,
+        cr.type
       FROM conversion_requests cr
       JOIN users u ON u.id = cr.user_id
-      WHERE cr.session_id = ? AND cr.status = 'PENDING'
+      WHERE cr.session_id = ?
+        AND cr.status = 'PENDING'
+        AND cr.type = 'TO_CHIPS'
+      ORDER BY cr.created_at ASC, cr.id ASC
+      `,
+      [session.id],
+    );
+
+    const [waitingCashOuts] = await db.execute(
+      `
+      SELECT
+        cr.id,
+        cr.user_id,
+        u.username,
+        u.profile_image_base64,
+        cr.amount_mode,
+        cr.amount_total,
+        cr.status,
+        cr.created_at,
+        cr.type,
+        COALESCE((
+          SELECT SUM(cr1.amount_total)
+          FROM conversion_requests cr1
+          WHERE cr1.session_id = cr.session_id
+            AND cr1.user_id = cr.user_id
+            AND cr1.status = 'APPROVED'
+            AND cr1.type = 'TO_CHIPS'
+        ), 0) AS buy_in_total
+      FROM conversion_requests cr
+      JOIN users u ON u.id = cr.user_id
+      WHERE cr.session_id = ?
+        AND cr.status = 'PENDING'
+        AND cr.type = 'TO_COINS'
       ORDER BY cr.created_at ASC, cr.id ASC
       `,
       [session.id],
@@ -245,12 +303,80 @@ async function getActiveSession(req, res) {
       [session.id, req.user.id],
     );
 
+    const [tableRows] = await db.execute(
+      `
+      SELECT
+        COALESCE(SUM(CASE
+          WHEN cr.type = 'TO_CHIPS' THEN cr.amount_total
+          WHEN cr.type = 'TO_COINS' THEN -cr.amount_total
+          ELSE 0
+        END), 0) AS table_total
+      FROM conversion_requests cr
+      WHERE cr.session_id = ?
+        AND cr.status = 'APPROVED'
+      `,
+      [session.id],
+    );
+
+    const normalizedPlayers = players.map((row) => ({
+      user_id: Number(row.user_id),
+      username: row.username,
+      profile_image_base64: row.profile_image_base64 || null,
+      buy_in_total: Number(row.buy_in_total || 0),
+      stack_amount: Number(row.stack_amount || 0),
+    }));
+
+    const normalizedWaitingBuyIns = waitingBuyIns.map((row) => ({
+      id: Number(row.id),
+      user_id: Number(row.user_id),
+      username: row.username,
+      profile_image_base64: row.profile_image_base64 || null,
+      amount_mode: row.amount_mode,
+      amount_total: Number(row.amount_total || 0),
+      status: row.status,
+      created_at: row.created_at,
+      type: row.type,
+    }));
+
+    const normalizedWaitingCashOuts = waitingCashOuts.map((row) => {
+      const buyInTotal = Number(row.buy_in_total || 0);
+      const amountTotal = Number(row.amount_total || 0);
+      return {
+        id: Number(row.id),
+        user_id: Number(row.user_id),
+        username: row.username,
+        profile_image_base64: row.profile_image_base64 || null,
+        amount_mode: row.amount_mode,
+        amount_total: amountTotal,
+        buy_in_total: buyInTotal,
+        pnl: amountTotal - buyInTotal,
+        status: row.status,
+        created_at: row.created_at,
+        type: row.type,
+      };
+    });
+
     res.json({
       activeSession: {
         ...session,
-        players,
-        pendingRequests,
-        myPendingRequest: myPendingRows[0] || null,
+        players: normalizedPlayers,
+        waitingBuyIns: normalizedWaitingBuyIns,
+        waitingCashOuts: normalizedWaitingCashOuts,
+        pendingRequests: [...normalizedWaitingBuyIns, ...normalizedWaitingCashOuts],
+        myPendingRequest: myPendingRows[0]
+          ? {
+              ...myPendingRows[0],
+              id: Number(myPendingRows[0].id),
+              user_id: Number(myPendingRows[0].user_id),
+              amount_total: Number(myPendingRows[0].amount_total || 0),
+            }
+          : null,
+        metrics: {
+          playingCount: normalizedPlayers.length,
+          waitingBuyInCount: normalizedWaitingBuyIns.length,
+          waitingCashOutCount: normalizedWaitingCashOuts.length,
+          tableTotal: Number(tableRows[0].table_total || 0),
+        },
       },
     });
   } catch (error) {
@@ -296,9 +422,7 @@ async function startSession(req, res) {
     }
 
     if (buyInAmount <= 0) {
-      return res.status(400).json({
-        message: "Admin buy-in must be greater than 0",
-      });
+      return res.status(400).json({ message: "Admin buy-in must be greater than 0" });
     }
 
     await connection.beginTransaction();
@@ -315,9 +439,7 @@ async function startSession(req, res) {
 
     if (activeRows.length > 0) {
       await connection.rollback();
-      return res
-        .status(400)
-        .json({ message: "There is already an active session" });
+      return res.status(400).json({ message: "There is already an active session" });
     }
 
     const adminBalance = await getUserBalance(connection, adminUserId);
