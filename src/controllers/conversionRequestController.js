@@ -233,8 +233,9 @@ async function createConversionRequest(req, res) {
     await connection.beginTransaction();
 
     const activeSession = await getActiveSession(connection);
-    const sessionId = activeSession ? activeSession.id : null;
-    const targetUserId = isAdmin && target_user_id ? Number(target_user_id) : actorUserId;
+    const sessionId = !isAdmin && activeSession ? activeSession.id : null;
+    const targetUserId =
+      isAdmin && target_user_id ? Number(target_user_id) : actorUserId;
 
     if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
       await connection.rollback();
@@ -248,16 +249,21 @@ async function createConversionRequest(req, res) {
       return res.status(404).json({ message: "Target user not found" });
     }
 
-    const pendingRequest = await getPendingRequestForUser(connection, targetUserId);
+    if (!isAdmin) {
+      const pendingRequest = await getPendingRequestForUser(
+        connection,
+        targetUserId,
+      );
 
-    if (pendingRequest) {
-      await connection.rollback();
-      return res.status(400).json({
-        message:
-          targetUserId === actorUserId
-            ? "You already have a pending request waiting for admin approval"
-            : "This user already has a pending request waiting for admin approval",
-      });
+      if (pendingRequest) {
+        await connection.rollback();
+        return res.status(400).json({
+          message:
+            targetUserId === actorUserId
+              ? "You already have a pending request waiting for admin approval"
+              : "This user already has a pending request waiting for admin approval",
+        });
+      }
     }
 
     if (!activeSession && !isAdmin) {
@@ -281,7 +287,9 @@ async function createConversionRequest(req, res) {
       });
     } catch (error) {
       await connection.rollback();
-      return res.status(400).json({ message: error.message || "Invalid amount" });
+      return res
+        .status(400)
+        .json({ message: error.message || "Invalid amount" });
     }
 
     if (type === "TO_CHIPS" && finalAmount <= 0) {
@@ -328,29 +336,36 @@ async function createConversionRequest(req, res) {
     }
 
     if (isAdmin) {
+      if (finalAmount <= 0) {
+        await connection.rollback();
+        return res.status(400).json({
+          message: "Amount must be greater than 0",
+        });
+      }
+
       const [requestResult] = await connection.execute(
         `
-        INSERT INTO conversion_requests
-        (
-          user_id,
-          session_id,
-          type,
-          amount_mode,
-          amount_total,
-          white_count,
-          red_count,
-          blue_count,
-          green_count,
-          black_count,
-          status,
-          admin_user_id,
-          admin_decision_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, NOW())
-        `,
+    INSERT INTO conversion_requests
+    (
+      user_id,
+      session_id,
+      type,
+      amount_mode,
+      amount_total,
+      white_count,
+      red_count,
+      blue_count,
+      green_count,
+      black_count,
+      status,
+      admin_user_id,
+      admin_decision_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, NOW())
+    `,
         [
           targetUserId,
-          sessionId,
+          null,
           type,
           amount_mode,
           finalAmount,
@@ -364,49 +379,35 @@ async function createConversionRequest(req, res) {
       );
 
       let direction;
-      let fromUnit;
-      let toUnit;
       let transactionType;
       let note;
 
       if (type === "TO_CHIPS") {
         direction = "DEBIT";
-        fromUnit = "DOUBLE_O";
-        toUnit = "CHIPS";
         transactionType = "CONVERSION_TO_CHIPS";
-        note = `Admin direct buy-in for ${targetUser.username}`;
+        note = `Admin manual withdraw for ${targetUser.username}`;
       } else {
         direction = "CREDIT";
-        fromUnit = "CHIPS";
-        toUnit = "DOUBLE_O";
         transactionType = "CONVERSION_TO_COINS";
-        note = `Admin direct cash out for ${targetUser.username}`;
+        note = `Admin manual deposit for ${targetUser.username}`;
       }
 
       await insertTransaction(connection, {
         user_id: targetUserId,
         created_by_user_id: actorUserId,
-        session_id: sessionId,
+        session_id: null,
         type: transactionType,
         direction,
         amount: finalAmount,
-        from_unit: fromUnit,
-        to_unit: toUnit,
+        from_unit: null,
+        to_unit: null,
         note,
       });
-
-      if (sessionId) {
-        if (type === "TO_CHIPS") {
-          await upsertSessionPlayerPlaying(connection, sessionId, targetUserId);
-        } else {
-          await markSessionPlayerOut(connection, sessionId, targetUserId);
-        }
-      }
 
       await connection.commit();
 
       return res.status(201).json({
-        message: "Conversion completed successfully",
+        message: "Manual balance update completed successfully",
         requestId: requestResult.insertId,
         amount: finalAmount,
         approved: true,
@@ -559,7 +560,8 @@ async function getConversionRequestsFeed(req, res) {
           : "Conversion request to Double O",
       created_at: row.created_at,
       admin_decision_at: row.admin_decision_at,
-      admin_user_id: row.admin_user_id === null ? null : Number(row.admin_user_id),
+      admin_user_id:
+        row.admin_user_id === null ? null : Number(row.admin_user_id),
       admin_username: row.admin_username || null,
     }));
 
@@ -580,16 +582,18 @@ async function getConversionRequestsFeed(req, res) {
       admin_username: null,
     }));
 
-    const merged = [...normalizedRequests, ...normalizedBonuses].sort((a, b) => {
-      const aTime = new Date(a.created_at).getTime();
-      const bTime = new Date(b.created_at).getTime();
+    const merged = [...normalizedRequests, ...normalizedBonuses].sort(
+      (a, b) => {
+        const aTime = new Date(a.created_at).getTime();
+        const bTime = new Date(b.created_at).getTime();
 
-      if (bTime !== aTime) {
-        return bTime - aTime;
-      }
+        if (bTime !== aTime) {
+          return bTime - aTime;
+        }
 
-      return String(b.id).localeCompare(String(a.id));
-    });
+        return String(b.id).localeCompare(String(a.id));
+      },
+    );
 
     res.json(merged);
   } catch (error) {
@@ -686,7 +690,11 @@ async function approveConversionRequest(req, res) {
       });
 
       if (request.session_id) {
-        await upsertSessionPlayerPlaying(connection, request.session_id, request.user_id);
+        await upsertSessionPlayerPlaying(
+          connection,
+          request.session_id,
+          request.user_id,
+        );
       }
     } else {
       await insertTransaction(connection, {
@@ -702,7 +710,11 @@ async function approveConversionRequest(req, res) {
       });
 
       if (request.session_id) {
-        await markSessionPlayerOut(connection, request.session_id, request.user_id);
+        await markSessionPlayerOut(
+          connection,
+          request.session_id,
+          request.user_id,
+        );
       }
     }
 
