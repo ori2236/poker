@@ -7,6 +7,8 @@ const balanceRoutes = require("./routes/balanceRoutes");
 const transactionRoutes = require("./routes/transactionRoutes");
 const conversionRequestRoutes = require("./routes/conversionRequestRoutes");
 const sessionRoutes = require("./routes/sessionRoutes");
+const bonusRoutes = require("./routes/bonusRoutes");
+const requestRoutes = require("./routes/requestRoutes");
 
 const app = express();
 
@@ -26,6 +28,8 @@ app.use("/users", userRoutes);
 app.use("/balances", balanceRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/conversion-requests", conversionRequestRoutes);
+app.use("/bonuses", bonusRoutes);
+app.use("/requests", requestRoutes);
 app.use("/sessions", sessionRoutes);
 
 module.exports = app;
