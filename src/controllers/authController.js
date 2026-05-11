@@ -4,10 +4,14 @@ const crypto = require("crypto");
 
 async function register(req, res) {
   try {
-    const { username, password, profileImageBase64 } = req.body;
+    const { username, password, confirmPassword, profileImageBase64 } = req.body;
 
     if (!username || !password || !profileImageBase64) {
       return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    if (confirmPassword !== undefined && password !== confirmPassword) {
+      return res.status(400).json({ message: "Passwords do not match" });
     }
 
     const [existingUsers] = await db.execute(

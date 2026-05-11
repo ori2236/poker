@@ -54,18 +54,20 @@ async function getLeaderboard(req, res) {
         u.id,
         u.username,
         u.profile_image_base64,
+        u.created_at,
         COALESCE(SUM(
           CASE 
             WHEN bt.direction = 'CREDIT' THEN bt.amount
             WHEN bt.direction = 'DEBIT' THEN -bt.amount
             ELSE 0
           END
-        ), 0) AS balance
+        ), 0) AS balance,
+        COALESCE(MAX(bt.created_at), u.created_at) AS balance_held_since
       FROM users u
       LEFT JOIN balance_transactions bt ON bt.user_id = u.id
       WHERE u.is_active = 1
-      GROUP BY u.id, u.username, u.profile_image_base64
-      ORDER BY balance DESC, u.username ASC
+      GROUP BY u.id, u.username, u.profile_image_base64, u.created_at
+      ORDER BY balance DESC, balance_held_since ASC, u.created_at ASC, u.username ASC
     `);
 
     res.json(
