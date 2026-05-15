@@ -171,6 +171,59 @@ async function getPendingCashout(connection, sessionId, userId) {
   return rows[0] || null;
 }
 
+async function refreshWinnerCoinHolders(connection) {
+  const [rankedRows] = await connection.execute(`
+    SELECT
+      u.id,
+      u.username,
+      COALESCE(SUM(
+        CASE
+          WHEN bt.direction = 'CREDIT' THEN bt.amount
+          WHEN bt.direction = 'DEBIT' THEN -bt.amount
+          ELSE 0
+        END
+      ), 0) AS today_net
+    FROM users u
+    LEFT JOIN balance_transactions bt
+      ON bt.user_id = u.id
+     AND DATE(bt.created_at) = CURDATE()
+    WHERE u.is_active = 1
+    GROUP BY u.id, u.username
+    ORDER BY today_net DESC, u.username ASC
+  `);
+
+  if (rankedRows.length === 0) {
+    await connection.execute("UPDATE users SET is_winner_coin_holder = 0");
+    return [];
+  }
+
+  const bestTodayNet = Number(rankedRows[0].today_net || 0);
+
+  const winners = rankedRows.filter(
+    (row) => Number(row.today_net || 0) === bestTodayNet,
+  );
+
+  await connection.execute("UPDATE users SET is_winner_coin_holder = 0");
+
+  if (winners.length > 0) {
+    const placeholders = winners.map(() => "?").join(", ");
+    await connection.execute(
+      `
+      UPDATE users
+      SET is_winner_coin_holder = 1
+      WHERE id IN (${placeholders})
+      `,
+      winners.map((winner) => winner.id),
+    );
+  }
+
+  return winners.map((winner) => ({
+    id: Number(winner.id),
+    username: winner.username,
+    todayNet: Number(winner.today_net || 0),
+  }));
+}
+
 async function getActiveSession(req, res) {
   try {
     const [sessionRows] = await db.execute(
@@ -653,6 +706,7 @@ async function endActiveSession(req, res) {
       [adminUserId, sessionId],
     );
 
+    const winnerCoinHolders = await refreshWinnerCoinHolders(connection);
     await connection.commit();
 
     res.json({
@@ -660,6 +714,7 @@ async function endActiveSession(req, res) {
       forcedZeroCashOutCount,
       preservedPendingCashOutCount,
       adminCashOutAmount: adminCashoutAmount,
+      winnerCoinHolders,
     });
   } catch (error) {
     await connection.rollback();

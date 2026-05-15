@@ -55,6 +55,10 @@ async function getLeaderboard(req, res) {
         u.username,
         u.profile_image_base64,
         u.created_at,
+        u.card_hand,
+        u.selected_coin_1,
+        u.selected_coin_2,
+        u.is_winner_coin_holder,
         COALESCE(SUM(
           CASE 
             WHEN bt.direction = 'CREDIT' THEN bt.amount
@@ -73,18 +77,30 @@ async function getLeaderboard(req, res) {
       FROM users u
       LEFT JOIN balance_transactions bt ON bt.user_id = u.id
       WHERE u.is_active = 1
-      GROUP BY u.id, u.username, u.profile_image_base64, u.created_at
+      GROUP BY 
+        u.id,
+        u.username,
+        u.profile_image_base64,
+        u.created_at,
+        u.card_hand,
+        u.selected_coin_1,
+        u.selected_coin_2,
+        u.is_winner_coin_holder
       ORDER BY balance DESC, balance_held_since ASC, u.created_at ASC, u.username ASC
     `);
 
     res.json(
       rows.map((row, index) => ({
         rank: index + 1,
-        id: row.id,
+        id: Number(row.id),
         username: row.username,
         profile_image_base64: row.profile_image_base64,
         balance: Number(row.balance),
         todayNet: Number(row.today_net),
+        card_hand: row.card_hand || "HIGH_CARD",
+        selected_coin_1: row.selected_coin_1 || "APP",
+        selected_coin_2: row.selected_coin_2 || "CARD",
+        is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
       })),
     );
   } catch (error) {
