@@ -62,6 +62,13 @@ async function getLeaderboard(req, res) {
             ELSE 0
           END
         ), 0) AS balance,
+        COALESCE(SUM(
+          CASE 
+            WHEN DATE(bt.created_at) = CURDATE() AND bt.direction = 'CREDIT' THEN bt.amount
+            WHEN DATE(bt.created_at) = CURDATE() AND bt.direction = 'DEBIT' THEN -bt.amount
+            ELSE 0
+          END
+        ), 0) AS today_net,
         COALESCE(MAX(bt.created_at), u.created_at) AS balance_held_since
       FROM users u
       LEFT JOIN balance_transactions bt ON bt.user_id = u.id
@@ -77,6 +84,7 @@ async function getLeaderboard(req, res) {
         username: row.username,
         profile_image_base64: row.profile_image_base64,
         balance: Number(row.balance),
+        todayNet: Number(row.today_net),
       })),
     );
   } catch (error) {
