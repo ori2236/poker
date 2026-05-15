@@ -98,8 +98,11 @@ async function getLeaderboard(req, res) {
         balance: Number(row.balance),
         todayNet: Number(row.today_net),
         card_hand: row.card_hand || "HIGH_CARD",
-        selected_coin_1: row.selected_coin_1 || "APP",
-        selected_coin_2: row.selected_coin_2 || "CARD",
+
+        // חשוב: משאירים null אם המשתמש בחר בלי מטבעות / מטבע אחד.
+        selected_coin_1: row.selected_coin_1,
+        selected_coin_2: row.selected_coin_2,
+
         is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
       })),
     );

@@ -20,12 +20,7 @@ function normalizeCardHand(value) {
   const normalized = String(value || "")
     .trim()
     .toUpperCase();
-
-  if (!CARD_HANDS.includes(normalized)) {
-    return null;
-  }
-
-  return normalized;
+  return CARD_HANDS.includes(normalized) ? normalized : null;
 }
 
 function normalizeSelectedCoin(value) {
@@ -66,8 +61,11 @@ async function getAllUsers(req, res) {
         id: Number(row.id),
         is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
         card_hand: row.card_hand || "HIGH_CARD",
-        selected_coin_1: row.selected_coin_1 || "APP",
-        selected_coin_2: row.selected_coin_2 || "CARD",
+
+        // חשוב: לא מחזירים כאן APP/CARD כברירת מחדל,
+        // כדי ש-Clear All ומטבע אחד בלבד יעבדו באמת.
+        selected_coin_1: row.selected_coin_1,
+        selected_coin_2: row.selected_coin_2,
       })),
     );
   } catch (error) {
@@ -187,16 +185,11 @@ async function updateMySelectedCoins(req, res) {
     const userId = req.user.id;
     const { selectedCoin1, selectedCoin2 } = req.body;
 
-    let firstCoin = normalizeSelectedCoin(selectedCoin1);
-    let secondCoin = normalizeSelectedCoin(selectedCoin2);
+    const firstCoin = normalizeSelectedCoin(selectedCoin1);
+    const secondCoin = normalizeSelectedCoin(selectedCoin2);
 
     if (firstCoin === undefined || secondCoin === undefined) {
       return res.status(400).json({ message: "Invalid coin selection" });
-    }
-
-    if (!firstCoin && secondCoin) {
-      firstCoin = secondCoin;
-      secondCoin = null;
     }
 
     if (firstCoin && secondCoin && firstCoin === secondCoin) {
