@@ -256,10 +256,145 @@ async function updateUserCardHand(req, res) {
   }
 }
 
+
+async function deleteUserByAdmin(req, res) {
+  const connection = await db.getConnection();
+
+  try {
+    const adminUserId = Number(req.user.id);
+    const targetUserId = Number(req.params.id);
+    const { adminPassword } = req.body;
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    if (!adminPassword) {
+      return res.status(400).json({ message: "Admin password is required" });
+    }
+
+    if (targetUserId === adminUserId) {
+      return res.status(400).json({ message: "You cannot delete your own admin user" });
+    }
+
+    await connection.beginTransaction();
+
+    const [adminRows] = await connection.execute(
+      `
+      SELECT id, password_hash, role, is_active
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [adminUserId],
+    );
+
+    if (adminRows.length === 0 || adminRows[0].role !== "ADMIN" || Number(adminRows[0].is_active) !== 1) {
+      await connection.rollback();
+      return res.status(403).json({ message: "Admin user is not allowed" });
+    }
+
+    const passwordOk = await bcrypt.compare(adminPassword, adminRows[0].password_hash);
+
+    if (!passwordOk) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Admin password is incorrect" });
+    }
+
+    const [targetRows] = await connection.execute(
+      `
+      SELECT id, username, role, is_active
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [targetUserId],
+    );
+
+    if (targetRows.length === 0 || Number(targetRows[0].is_active) !== 1) {
+      await connection.rollback();
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (targetRows[0].role === "ADMIN") {
+      await connection.rollback();
+      return res.status(400).json({ message: "Admin users cannot be deleted" });
+    }
+
+    await connection.execute(
+      `
+      UPDATE users
+      SET is_active = 0
+      WHERE id = ?
+      `,
+      [targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE auth_sessions
+      SET is_active = 0
+      WHERE user_id = ?
+      `,
+      [targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE session_players
+      SET is_playing = FALSE, left_at = COALESCE(left_at, NOW())
+      WHERE user_id = ? AND is_playing = TRUE
+      `,
+      [targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE conversion_requests
+      SET
+        status = 'REJECTED',
+        admin_user_id = ?,
+        admin_decision_at = NOW()
+      WHERE user_id = ? AND status = 'PENDING'
+      `,
+      [adminUserId, targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE bonus_requests
+      SET
+        status = 'REJECTED',
+        admin_user_id = ?,
+        admin_decision_at = NOW()
+      WHERE user_id = ? AND status = 'PENDING'
+      `,
+      [adminUserId, targetUserId],
+    );
+
+    await connection.commit();
+
+    res.json({
+      message: "User deleted successfully",
+      userId: targetUserId,
+      username: targetRows[0].username,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error("deleteUserByAdmin error:", error);
+    res.status(500).json({ message: "Server error" });
+  } finally {
+    connection.release();
+  }
+}
+
 module.exports = {
   getAllUsers,
   updateMyProfile,
   changeMyPassword,
   updateMySelectedCoins,
   updateUserCardHand,
+  deleteUserByAdmin,
 };

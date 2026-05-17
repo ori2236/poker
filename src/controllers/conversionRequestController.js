@@ -312,13 +312,9 @@ async function createConversionRequest(req, res) {
         });
       }
 
-      if (isPlaying && type !== "TO_COINS") {
-        await connection.rollback();
-        return res.status(400).json({
-          message:
-            "You can request buy-in only when you are not currently playing",
-        });
-      }
+      // Add-on buy-in is allowed while already playing.
+      // The global pending-request guard above still prevents confusing flows,
+      // including opening a new buy-in while a cash-out is waiting for approval.
     }
 
     if (type === "TO_CHIPS") {

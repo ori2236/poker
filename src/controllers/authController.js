@@ -15,7 +15,7 @@ async function register(req, res) {
     }
 
     const [existingUsers] = await db.execute(
-      "SELECT id FROM users WHERE username = ? LIMIT 1",
+      "SELECT id FROM users WHERE username = ? AND is_active = 1 LIMIT 1",
       [username],
     );
 
@@ -56,7 +56,7 @@ async function login(req, res) {
     const { username, password } = req.body;
 
     const [rows] = await db.execute(
-      "SELECT id, username, password_hash, role FROM users WHERE username = ? LIMIT 1",
+      "SELECT id, username, password_hash, role, is_active FROM users WHERE username = ? AND is_active = 1 LIMIT 1",
       [username],
     );
 
