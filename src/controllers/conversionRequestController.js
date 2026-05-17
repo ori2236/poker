@@ -216,6 +216,7 @@ async function createConversionRequest(req, res) {
       green_count = 0,
       black_count = 0,
       target_user_id,
+      session_add_on = false,
     } = req.body;
 
     if (!type || !amount_mode) {
@@ -233,7 +234,16 @@ async function createConversionRequest(req, res) {
     await connection.beginTransaction();
 
     const activeSession = await getActiveSession(connection);
-    const sessionId = !isAdmin && activeSession ? activeSession.id : null;
+    const isAdminSessionAddOn =
+      isAdmin &&
+      session_add_on === true &&
+      type === "TO_CHIPS" &&
+      !target_user_id;
+
+    const sessionId =
+      activeSession && (!isAdmin || isAdminSessionAddOn)
+        ? activeSession.id
+        : null;
     const targetUserId =
       isAdmin && target_user_id ? Number(target_user_id) : actorUserId;
 
@@ -266,7 +276,7 @@ async function createConversionRequest(req, res) {
       }
     }
 
-    if (!activeSession && !isAdmin) {
+    if (!activeSession && (!isAdmin || session_add_on === true)) {
       await connection.rollback();
       return res.status(400).json({
         message: "Requests are allowed only during an active session",
@@ -332,6 +342,13 @@ async function createConversionRequest(req, res) {
     }
 
     if (isAdmin) {
+      if (isAdminSessionAddOn && !sessionId) {
+        await connection.rollback();
+        return res.status(400).json({
+          message: "Admin add-in is allowed only during an active session",
+        });
+      }
+
       if (finalAmount <= 0) {
         await connection.rollback();
         return res.status(400).json({
@@ -361,7 +378,7 @@ async function createConversionRequest(req, res) {
     `,
         [
           targetUserId,
-          null,
+          isAdminSessionAddOn ? sessionId : null,
           type,
           amount_mode,
           finalAmount,
@@ -381,7 +398,9 @@ async function createConversionRequest(req, res) {
       if (type === "TO_CHIPS") {
         direction = "DEBIT";
         transactionType = "CONVERSION_TO_CHIPS";
-        note = `Admin manual withdraw for ${targetUser.username}`;
+        note = isAdminSessionAddOn
+          ? `Admin session add-in for ${targetUser.username}`
+          : `Admin manual withdraw for ${targetUser.username}`;
       } else {
         direction = "CREDIT";
         transactionType = "CONVERSION_TO_COINS";
@@ -391,7 +410,7 @@ async function createConversionRequest(req, res) {
       await insertTransaction(connection, {
         user_id: targetUserId,
         created_by_user_id: actorUserId,
-        session_id: null,
+        session_id: isAdminSessionAddOn ? sessionId : null,
         type: transactionType,
         direction,
         amount: finalAmount,
@@ -400,10 +419,16 @@ async function createConversionRequest(req, res) {
         note,
       });
 
+      if (isAdminSessionAddOn) {
+        await upsertSessionPlayerPlaying(connection, sessionId, targetUserId);
+      }
+
       await connection.commit();
 
       return res.status(201).json({
-        message: "Manual balance update completed successfully",
+        message: isAdminSessionAddOn
+          ? "Admin buy-in added to the active session"
+          : "Manual balance update completed successfully",
         requestId: requestResult.insertId,
         amount: finalAmount,
         approved: true,
