@@ -312,9 +312,9 @@ async function createConversionRequest(req, res) {
         });
       }
 
-      // Add-on buy-in is allowed while already playing.
-      // The global pending-request guard above still prevents confusing flows,
-      // including opening a new buy-in while a cash-out is waiting for approval.
+      // A player who is already in the session may request another TO_CHIPS add-on.
+      // The global pending-request check above still prevents opening a new buy-in
+      // while a cash-out or another buy-in is waiting for admin approval.
     }
 
     if (type === "TO_CHIPS") {

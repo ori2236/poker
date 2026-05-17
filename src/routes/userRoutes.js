@@ -10,7 +10,9 @@ const {
   changeMyPassword,
   updateMySelectedCoins,
   updateUserCardHand,
-  deleteUserByAdmin,
+  deleteUser,
+  updateUserSecondaryImage,
+  resetUserPassword,
 } = require("../controllers/userController");
 
 router.get("/", authMiddleware, getAllUsers);
@@ -23,11 +25,26 @@ router.patch(
   adminMiddleware,
   updateUserCardHand,
 );
+
 router.post(
   "/:id/delete",
   authMiddleware,
   adminMiddleware,
-  deleteUserByAdmin,
+  deleteUser,
+);
+
+router.patch(
+  "/:id/secondary-image",
+  authMiddleware,
+  adminMiddleware,
+  updateUserSecondaryImage,
+);
+
+router.post(
+  "/:id/reset-password",
+  authMiddleware,
+  adminMiddleware,
+  resetUserPassword,
 );
 
 module.exports = router;

@@ -45,6 +45,7 @@ async function getAllUsers(req, res) {
         username,
         role,
         profile_image_base64,
+        secondary_profile_image_base64,
         created_at,
         card_hand,
         selected_coin_1,
@@ -257,15 +258,16 @@ async function updateUserCardHand(req, res) {
 }
 
 
-async function deleteUserByAdmin(req, res) {
+
+async function deleteUser(req, res) {
   const connection = await db.getConnection();
 
   try {
-    const adminUserId = Number(req.user.id);
+    const adminUserId = req.user.id;
     const targetUserId = Number(req.params.id);
     const { adminPassword } = req.body;
 
-    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+    if (!targetUserId || Number.isNaN(targetUserId)) {
       return res.status(400).json({ message: "Invalid user id" });
     }
 
@@ -274,70 +276,53 @@ async function deleteUserByAdmin(req, res) {
     }
 
     if (targetUserId === adminUserId) {
-      return res.status(400).json({ message: "You cannot delete your own admin user" });
+      return res.status(400).json({ message: "You cannot delete yourself" });
     }
 
     await connection.beginTransaction();
 
     const [adminRows] = await connection.execute(
-      `
-      SELECT id, password_hash, role, is_active
-      FROM users
-      WHERE id = ?
-      LIMIT 1
-      FOR UPDATE
-      `,
+      "SELECT password_hash FROM users WHERE id = ? AND role = 'ADMIN' AND is_active = 1 LIMIT 1",
       [adminUserId],
     );
 
-    if (adminRows.length === 0 || adminRows[0].role !== "ADMIN" || Number(adminRows[0].is_active) !== 1) {
+    if (adminRows.length === 0) {
       await connection.rollback();
-      return res.status(403).json({ message: "Admin user is not allowed" });
+      return res.status(403).json({ message: "Admin user not found" });
     }
 
-    const passwordOk = await bcrypt.compare(adminPassword, adminRows[0].password_hash);
+    const passwordValid = await bcrypt.compare(
+      String(adminPassword),
+      adminRows[0].password_hash,
+    );
 
-    if (!passwordOk) {
+    if (!passwordValid) {
       await connection.rollback();
       return res.status(400).json({ message: "Admin password is incorrect" });
     }
 
     const [targetRows] = await connection.execute(
-      `
-      SELECT id, username, role, is_active
-      FROM users
-      WHERE id = ?
-      LIMIT 1
-      FOR UPDATE
-      `,
+      "SELECT id, role FROM users WHERE id = ? AND is_active = 1 LIMIT 1 FOR UPDATE",
       [targetUserId],
     );
 
-    if (targetRows.length === 0 || Number(targetRows[0].is_active) !== 1) {
+    if (targetRows.length === 0) {
       await connection.rollback();
       return res.status(404).json({ message: "User not found" });
     }
 
     if (targetRows[0].role === "ADMIN") {
       await connection.rollback();
-      return res.status(400).json({ message: "Admin users cannot be deleted" });
+      return res.status(400).json({ message: "Cannot delete an admin user" });
     }
 
     await connection.execute(
-      `
-      UPDATE users
-      SET is_active = 0
-      WHERE id = ?
-      `,
+      "UPDATE users SET is_active = 0 WHERE id = ?",
       [targetUserId],
     );
 
     await connection.execute(
-      `
-      UPDATE auth_sessions
-      SET is_active = 0
-      WHERE user_id = ?
-      `,
+      "UPDATE auth_sessions SET is_active = 0 WHERE user_id = ?",
       [targetUserId],
     );
 
@@ -353,22 +338,7 @@ async function deleteUserByAdmin(req, res) {
     await connection.execute(
       `
       UPDATE conversion_requests
-      SET
-        status = 'REJECTED',
-        admin_user_id = ?,
-        admin_decision_at = NOW()
-      WHERE user_id = ? AND status = 'PENDING'
-      `,
-      [adminUserId, targetUserId],
-    );
-
-    await connection.execute(
-      `
-      UPDATE bonus_requests
-      SET
-        status = 'REJECTED',
-        admin_user_id = ?,
-        admin_decision_at = NOW()
+      SET status = 'REJECTED', admin_user_id = ?, admin_decision_at = NOW()
       WHERE user_id = ? AND status = 'PENDING'
       `,
       [adminUserId, targetUserId],
@@ -376,17 +346,90 @@ async function deleteUserByAdmin(req, res) {
 
     await connection.commit();
 
-    res.json({
-      message: "User deleted successfully",
-      userId: targetUserId,
-      username: targetRows[0].username,
-    });
+    res.json({ message: "User deleted successfully" });
   } catch (error) {
     await connection.rollback();
-    console.error("deleteUserByAdmin error:", error);
+    console.error("deleteUser error:", error);
     res.status(500).json({ message: "Server error" });
   } finally {
     connection.release();
+  }
+}
+
+async function updateUserSecondaryImage(req, res) {
+  try {
+    const targetUserId = Number(req.params.id);
+    const { secondaryProfileImageBase64 } = req.body;
+
+    if (!targetUserId || Number.isNaN(targetUserId)) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const [rows] = await db.execute(
+      "SELECT id FROM users WHERE id = ? AND is_active = 1 LIMIT 1",
+      [targetUserId],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const normalizedImage = secondaryProfileImageBase64
+      ? String(secondaryProfileImageBase64)
+      : null;
+
+    await db.execute(
+      "UPDATE users SET secondary_profile_image_base64 = ? WHERE id = ?",
+      [normalizedImage, targetUserId],
+    );
+
+    res.json({
+      message: "Secondary image updated successfully",
+      userId: targetUserId,
+    });
+  } catch (error) {
+    console.error("updateUserSecondaryImage error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+}
+
+async function resetUserPassword(req, res) {
+  try {
+    const targetUserId = Number(req.params.id);
+
+    if (!targetUserId || Number.isNaN(targetUserId)) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const [rows] = await db.execute(
+      "SELECT id, role FROM users WHERE id = ? AND is_active = 1 LIMIT 1",
+      [targetUserId],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (rows[0].role === "ADMIN") {
+      return res.status(400).json({ message: "Cannot reset an admin password from here" });
+    }
+
+    const passwordHash = await bcrypt.hash("123456", 10);
+
+    await db.execute("UPDATE users SET password_hash = ? WHERE id = ?", [
+      passwordHash,
+      targetUserId,
+    ]);
+
+    await db.execute(
+      "UPDATE auth_sessions SET is_active = 0 WHERE user_id = ?",
+      [targetUserId],
+    );
+
+    res.json({ message: "Password reset successfully" });
+  } catch (error) {
+    console.error("resetUserPassword error:", error);
+    res.status(500).json({ message: "Server error" });
   }
 }
 
@@ -396,5 +439,7 @@ module.exports = {
   changeMyPassword,
   updateMySelectedCoins,
   updateUserCardHand,
-  deleteUserByAdmin,
+  deleteUser,
+  updateUserSecondaryImage,
+  resetUserPassword,
 };

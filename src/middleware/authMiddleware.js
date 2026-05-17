@@ -13,7 +13,9 @@ async function authMiddleware(req, res, next) {
       SELECT users.id, users.username, users.role
       FROM auth_sessions
       JOIN users ON users.id = auth_sessions.user_id
-      WHERE auth_sessions.session_token = ? AND auth_sessions.is_active = 1 AND users.is_active = 1
+      WHERE auth_sessions.session_token = ?
+        AND auth_sessions.is_active = 1
+        AND users.is_active = 1
       LIMIT 1
       `,
       [token],
