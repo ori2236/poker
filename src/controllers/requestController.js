@@ -264,6 +264,7 @@ async function getRequestHistory(req, res) {
           cr.user_id,
           u.username,
           cr.session_id,
+          gs.title AS session_title,
           cr.amount_total AS amount,
           cr.status,
           CASE
@@ -278,6 +279,7 @@ async function getRequestHistory(req, res) {
         FROM conversion_requests cr
         JOIN users u ON u.id = cr.user_id
         LEFT JOIN users au ON au.id = cr.admin_user_id
+        LEFT JOIN game_sessions gs ON gs.id = cr.session_id
         ${conversionWhereClause}
         `,
         conversionParams,
@@ -288,6 +290,7 @@ async function getRequestHistory(req, res) {
           ...row,
           user_id: Number(row.user_id),
           session_id: row.session_id === null ? null : Number(row.session_id),
+          session_title: row.session_title || null,
           amount: Number(row.amount),
           admin_user_id: row.admin_user_id === null ? null : Number(row.admin_user_id),
         })),
@@ -330,6 +333,7 @@ async function getRequestHistory(req, res) {
           ...row,
           user_id: Number(row.user_id),
           session_id: null,
+          session_title: null,
           amount: Number(row.amount),
           admin_user_id: row.admin_user_id === null ? null : Number(row.admin_user_id),
         })),
