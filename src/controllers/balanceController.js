@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { getOwnedSpecialCoinsForUserIds } = require("../utils/coinUtils");
 
 async function getMyBalance(req, res) {
   try {
@@ -91,6 +92,11 @@ async function getLeaderboard(req, res) {
       ORDER BY balance DESC, balance_held_since ASC, u.created_at ASC, u.username ASC
     `);
 
+    const specialCoinsByUserId = await getOwnedSpecialCoinsForUserIds(
+      db,
+      rows.map((row) => row.id),
+    );
+
     res.json(
       rows.map((row, index) => ({
         rank: index + 1,
@@ -107,6 +113,7 @@ async function getLeaderboard(req, res) {
         selected_coin_2: row.selected_coin_2,
 
         is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
+        special_coins: specialCoinsByUserId.get(Number(row.id)) || [],
       })),
     );
   } catch (error) {

@@ -3,12 +3,14 @@ const cors = require("cors");
 
 const authRoutes = require("./routes/authRoutes");
 const userRoutes = require("./routes/userRoutes");
+const coinRoutes = require("./routes/coinRoutes");
 const balanceRoutes = require("./routes/balanceRoutes");
 const transactionRoutes = require("./routes/transactionRoutes");
 const conversionRequestRoutes = require("./routes/conversionRequestRoutes");
 const sessionRoutes = require("./routes/sessionRoutes");
 const bonusRoutes = require("./routes/bonusRoutes");
 const requestRoutes = require("./routes/requestRoutes");
+const actionRoutes = require("./routes/actionRoutes");
 
 const app = express();
 
@@ -25,11 +27,13 @@ app.get("/health", (req, res) => {
 
 app.use("/auth", authRoutes);
 app.use("/users", userRoutes);
+app.use("/coins", coinRoutes);
 app.use("/balances", balanceRoutes);
 app.use("/transactions", transactionRoutes);
 app.use("/conversion-requests", conversionRequestRoutes);
 app.use("/bonuses", bonusRoutes);
 app.use("/requests", requestRoutes);
+app.use("/actions", actionRoutes);
 app.use("/sessions", sessionRoutes);
 
 module.exports = app;

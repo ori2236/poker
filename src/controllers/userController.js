@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const bcrypt = require("bcrypt");
+const { getOwnedSpecialCoinsForUserIds } = require("../utils/coinUtils");
 
 const CARD_HANDS = [
   "HIGH_CARD",
@@ -56,6 +57,11 @@ async function getAllUsers(req, res) {
       ORDER BY username ASC
     `);
 
+    const specialCoinsByUserId = await getOwnedSpecialCoinsForUserIds(
+      db,
+      rows.map((row) => row.id),
+    );
+
     res.json(
       rows.map((row) => ({
         ...row,
@@ -67,6 +73,7 @@ async function getAllUsers(req, res) {
         // כדי ש-Clear All ומטבע אחד בלבד יעבדו באמת.
         selected_coin_1: row.selected_coin_1,
         selected_coin_2: row.selected_coin_2,
+        special_coins: specialCoinsByUserId.get(Number(row.id)) || [],
       })),
     );
   } catch (error) {

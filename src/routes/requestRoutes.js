@@ -7,6 +7,8 @@ const {
   getPendingRequests,
   approveBonusRequest,
   rejectBonusRequest,
+  approveCoinRequest,
+  rejectCoinRequest,
   getRequestHistory,
 } = require("../controllers/requestController");
 const {
@@ -39,6 +41,18 @@ router.post(
   authMiddleware,
   adminMiddleware,
   rejectBonusRequest,
+);
+router.post(
+  "/coin/:id/approve",
+  authMiddleware,
+  adminMiddleware,
+  approveCoinRequest,
+);
+router.post(
+  "/coin/:id/reject",
+  authMiddleware,
+  adminMiddleware,
+  rejectCoinRequest,
 );
 
 module.exports = router;
