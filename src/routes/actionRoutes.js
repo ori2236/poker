@@ -2,8 +2,8 @@ const express = require("express");
 const router = express.Router();
 
 const authMiddleware = require("../middleware/authMiddleware");
-const { getActionFeed } = require("../controllers/actionController");
+const { getActions } = require("../controllers/actionController");
 
-router.get("/", authMiddleware, getActionFeed);
+router.get("/", authMiddleware, getActions);
 
 module.exports = router;

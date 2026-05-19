@@ -1,19 +1,21 @@
 const db = require("../config/db");
-const { getOwnedSpecialCoinsForUserIds } = require("../utils/coinUtils");
+const {
+  clearSelectedSpecialCoin,
+} = require("../utils/coinHelpers");
 
-const STARTING_PRICE = 100;
-const PRICE_STEP = 50;
-
-function normalizeSelectedCoinCode(value) {
-  if (value === null || value === undefined || value === "") return null;
-  return String(value).trim();
+function toNumber(value) {
+  return Number(value || 0);
 }
 
-function normalizeStatus(value) {
-  if (value === "PAID_OWNED" || value === "FOR_SALE" || value === "EXCLUSIVE_LOCKED") {
-    return value;
-  }
-  return "AVAILABLE";
+async function ensureMarketRows(connection) {
+  await connection.execute(
+    `
+    INSERT IGNORE INTO coin_market_state (coin_id, status, current_price)
+    SELECT id, 'AVAILABLE', 100
+    FROM coin_catalog
+    WHERE is_active = 1
+    `,
+  );
 }
 
 async function getUserBalance(connection, userId) {
@@ -51,72 +53,90 @@ async function insertTransaction(connection, data) {
       to_unit,
       note
     )
-    VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     [
       data.user_id,
       data.created_by_user_id,
+      data.session_id || null,
       data.type,
       data.direction,
-      data.amount,
-      data.from_unit,
-      data.to_unit,
-      data.note,
+      Number(data.amount || 0),
+      data.from_unit || null,
+      data.to_unit || "DOUBLE_O",
+      data.note || null,
     ],
   );
 }
 
-async function ensureMarketState(connection, coinId) {
-  await connection.execute(
-    `
-    INSERT IGNORE INTO coin_market_state (coin_id, status, current_price)
-    VALUES (?, 'AVAILABLE', ?)
-    `,
-    [coinId, STARTING_PRICE],
-  );
-
-  const [rows] = await connection.execute(
-    `
-    SELECT *
-    FROM coin_market_state
-    WHERE coin_id = ?
-    LIMIT 1
-    FOR UPDATE
-    `,
-    [coinId],
-  );
-
-  return rows[0] || null;
-}
-
-async function getActiveCoinForUpdate(connection, coinId) {
-  const [coinRows] = await connection.execute(
-    `
-    SELECT id, code, title, description, category, image_mime, image_base64, sort_order
-    FROM coin_catalog
-    WHERE id = ? AND is_active = 1
-    LIMIT 1
-    FOR UPDATE
-    `,
-    [coinId],
-  );
-
-  if (coinRows.length === 0) {
-    return null;
-  }
-
-  const state = await ensureMarketState(connection, coinId);
+function mapCoinRow(row, userId, balance, pendingRequestCoinIds) {
+  const currentPrice = Number(row.current_price || 100);
+  const ownedByMe = Number(row.owner_user_id || 0) === Number(userId);
+  const isMarketOpen = row.status !== "EXCLUSIVE_LOCKED";
+  const canBuy = isMarketOpen && !ownedByMe;
+  const canListForSale = row.status === "PAID_OWNED" && ownedByMe;
+  const hasPendingRequest = pendingRequestCoinIds.has(Number(row.id));
+  const canRequestExclusive = isMarketOpen && !hasPendingRequest && (!ownedByMe || row.status === "PAID_OWNED");
 
   return {
-    coin: coinRows[0],
-    state,
+    id: Number(row.id),
+    code: row.code,
+    title: row.title,
+    description: row.description,
+    category: row.category,
+    image_mime: row.image_mime,
+    image_base64: row.image_base64,
+    sort_order: Number(row.sort_order || 0),
+    status: row.status || "AVAILABLE",
+    owner_user_id: row.owner_user_id === null ? null : Number(row.owner_user_id),
+    owner_username: row.owner_username || null,
+    current_price: currentPrice,
+    last_purchase_price: row.last_purchase_price === null ? null : Number(row.last_purchase_price),
+    sale_original_price: row.sale_original_price === null ? null : Number(row.sale_original_price),
+    sale_seller_user_id: row.sale_seller_user_id === null ? null : Number(row.sale_seller_user_id),
+    sale_seller_username: row.sale_seller_username || null,
+    sale_paid_upfront: Number(row.sale_paid_upfront || 0),
+    locked_forever: Boolean(row.locked_forever),
+    has_pending_request: hasPendingRequest,
+    owned_by_me: ownedByMe,
+    can_buy: canBuy,
+    can_list_for_sale: canListForSale,
+    can_request_exclusive: canRequestExclusive,
+    insufficient_balance: canBuy && balance < currentPrice,
   };
 }
 
 async function getCoins(req, res) {
+  const connection = await db.getConnection();
+
   try {
     const userId = req.user.id;
-    const [coins] = await db.execute(
+    await ensureMarketRows(connection);
+
+    const balance = await getUserBalance(connection, userId);
+
+    const [pendingRows] = await connection.execute(
+      `
+      SELECT coin_id
+      FROM coin_requests
+      WHERE user_id = ? AND status = 'PENDING'
+      `,
+      [userId],
+    );
+
+    const pendingRequestCoinIds = new Set(pendingRows.map((row) => Number(row.coin_id)));
+
+    const [selectedRows] = await connection.execute(
+      `
+      SELECT selected_coin_1, selected_coin_2
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [userId],
+    );
+
+    const [coins] = await connection.execute(
       `
       SELECT
         cc.id,
@@ -127,154 +147,38 @@ async function getCoins(req, res) {
         cc.image_mime,
         cc.image_base64,
         cc.sort_order,
-        COALESCE(cms.status, 'AVAILABLE') AS status,
-        COALESCE(cms.current_price, ?) AS current_price,
+        cms.status,
         cms.owner_user_id,
         owner.username AS owner_username,
+        cms.current_price,
         cms.last_purchase_price,
         cms.sale_original_price,
         cms.sale_seller_user_id,
         seller.username AS sale_seller_username,
         cms.sale_paid_upfront,
-        COALESCE(cms.locked_forever, 0) AS locked_forever,
-        EXISTS(
-          SELECT 1
-          FROM coin_requests cr
-          WHERE cr.coin_id = cc.id
-            AND cr.user_id = ?
-            AND cr.status = 'PENDING'
-        ) AS has_pending_request
+        cms.locked_forever
       FROM coin_catalog cc
-      LEFT JOIN coin_market_state cms ON cms.coin_id = cc.id
-      LEFT JOIN users owner ON owner.id = cms.owner_user_id
-      LEFT JOIN users seller ON seller.id = cms.sale_seller_user_id
+      JOIN coin_market_state cms ON cms.coin_id = cc.id
+      LEFT JOIN users owner ON owner.id = cms.owner_user_id AND owner.is_active = 1
+      LEFT JOIN users seller ON seller.id = cms.sale_seller_user_id AND seller.is_active = 1
       WHERE cc.is_active = 1
       ORDER BY cc.sort_order ASC, cc.id ASC
       `,
-      [STARTING_PRICE, userId],
     );
 
-    const balance = await getUserBalance(db, userId);
+    const selected = selectedRows[0] || {};
 
     res.json({
       balance,
-      priceStep: PRICE_STEP,
-      coins: coins.map((row) => {
-        const status = normalizeStatus(row.status);
-        const currentPrice = Number(row.current_price || STARTING_PRICE);
-        const ownerUserId = row.owner_user_id === null || row.owner_user_id === undefined ? null : Number(row.owner_user_id);
-        const saleSellerUserId = row.sale_seller_user_id === null || row.sale_seller_user_id === undefined ? null : Number(row.sale_seller_user_id);
-        const ownedByMe = ownerUserId === userId;
-        const isExclusive = status === "EXCLUSIVE_LOCKED" || Number(row.locked_forever) === 1;
-        const canBuy = !isExclusive && !ownedByMe && currentPrice > 0;
-        const canListForSale = status === "PAID_OWNED" && ownedByMe && Number(row.last_purchase_price || 0) > 0;
-        const canRequestExclusive = !isExclusive && Number(row.has_pending_request || 0) !== 1;
-
-        return {
-          id: Number(row.id),
-          code: row.code,
-          title: row.title,
-          description: row.description,
-          category: row.category,
-          image_mime: row.image_mime,
-          image_base64: row.image_base64,
-          sort_order: Number(row.sort_order || 0),
-          status,
-          current_price: currentPrice,
-          owner_user_id: ownerUserId,
-          owner_username: row.owner_username || null,
-          last_purchase_price: row.last_purchase_price === null ? null : Number(row.last_purchase_price),
-          sale_original_price: row.sale_original_price === null ? null : Number(row.sale_original_price),
-          sale_seller_user_id: saleSellerUserId,
-          sale_seller_username: row.sale_seller_username || null,
-          sale_paid_upfront: row.sale_paid_upfront === null ? 0 : Number(row.sale_paid_upfront),
-          locked_forever: isExclusive,
-          has_pending_request: Boolean(row.has_pending_request),
-          owned_by_me: ownedByMe,
-          can_buy: canBuy,
-          can_list_for_sale: canListForSale,
-          can_request_exclusive: canRequestExclusive,
-          insufficient_balance: canBuy && balance < currentPrice,
-        };
-      }),
+      selected_coin_1: selected.selected_coin_1 || null,
+      selected_coin_2: selected.selected_coin_2 || null,
+      coins: coins.map((row) => mapCoinRow(row, userId, balance, pendingRequestCoinIds)),
     });
   } catch (error) {
     console.error("getCoins error:", error);
     res.status(500).json({ message: "Failed to load coins" });
-  }
-}
-
-async function getMyCoinCollection(req, res) {
-  try {
-    const coinsMap = await getOwnedSpecialCoinsForUserIds(db, [req.user.id]);
-    res.json({ coins: coinsMap.get(req.user.id) || [] });
-  } catch (error) {
-    console.error("getMyCoinCollection error:", error);
-    res.status(500).json({ message: "Failed to load collection" });
-  }
-}
-
-async function getUserCoinCollection(req, res) {
-  try {
-    const userId = Number(req.params.userId);
-
-    if (!Number.isInteger(userId) || userId <= 0) {
-      return res.status(400).json({ message: "Invalid user id" });
-    }
-
-    const coinsMap = await getOwnedSpecialCoinsForUserIds(db, [userId]);
-    res.json({ userId, coins: coinsMap.get(userId) || [] });
-  } catch (error) {
-    console.error("getUserCoinCollection error:", error);
-    res.status(500).json({ message: "Failed to load collection" });
-  }
-}
-
-async function updateSelectedCoins(req, res) {
-  try {
-    const { selected_coin_1, selected_coin_2 } = req.body;
-    const first = normalizeSelectedCoinCode(selected_coin_1);
-    const second = normalizeSelectedCoinCode(selected_coin_2);
-
-    if (first && second && first === second) {
-      return res.status(400).json({ message: "Choose two different coins." });
-    }
-
-    const codes = [first, second].filter(Boolean);
-
-    if (codes.length > 0) {
-      const placeholders = codes.map(() => "?").join(", ");
-      const [existing] = await db.execute(
-        `
-        SELECT code
-        FROM coin_catalog
-        WHERE code IN (${placeholders}) AND is_active = 1
-        `,
-        codes,
-      );
-
-      if (existing.length !== codes.length) {
-        return res.status(400).json({ message: "Invalid coin selected." });
-      }
-    }
-
-    await db.execute(
-      `
-      UPDATE users
-      SET selected_coin_1 = ?, selected_coin_2 = ?
-      WHERE id = ?
-      `,
-      [first, second, req.user.id],
-    );
-
-    res.json({
-      message: "Selected coins updated",
-      selected_coin_1: first,
-      selected_coin_2: second,
-    });
-  } catch (error) {
-    console.error("updateSelectedCoins error:", error);
-    res.status(500).json({ message: "Failed to update selected coins" });
+  } finally {
+    connection.release();
   }
 }
 
@@ -290,87 +194,109 @@ async function buyCoin(req, res) {
     }
 
     await connection.beginTransaction();
+    await ensureMarketRows(connection);
 
-    const data = await getActiveCoinForUpdate(connection, coinId);
+    const [rows] = await connection.execute(
+      `
+      SELECT
+        cc.id,
+        cc.title,
+        cms.status,
+        cms.owner_user_id,
+        cms.current_price,
+        cms.last_purchase_price,
+        cms.sale_original_price,
+        cms.sale_seller_user_id,
+        cms.sale_paid_upfront,
+        cms.locked_forever
+      FROM coin_catalog cc
+      JOIN coin_market_state cms ON cms.coin_id = cc.id
+      WHERE cc.id = ? AND cc.is_active = 1
+      FOR UPDATE
+      `,
+      [coinId],
+    );
 
-    if (!data) {
+    if (rows.length === 0) {
       await connection.rollback();
       return res.status(404).json({ message: "Coin not found" });
     }
 
-    const { coin, state } = data;
-    const status = normalizeStatus(state.status);
-    const lockedForever = Number(state.locked_forever || 0) === 1 || status === "EXCLUSIVE_LOCKED";
-    const currentPrice = Number(state.current_price || STARTING_PRICE);
-    const currentOwnerId = state.owner_user_id === null ? null : Number(state.owner_user_id);
+    const coin = rows[0];
 
-    if (lockedForever) {
+    if (coin.status === "EXCLUSIVE_LOCKED" || coin.locked_forever) {
       await connection.rollback();
-      return res.status(400).json({ message: "This coin is exclusive and will never be for sale" });
+      return res.status(400).json({ message: "This coin is exclusive and is not for sale" });
     }
 
-    if (status === "PAID_OWNED" && currentOwnerId === userId) {
+    if (Number(coin.owner_user_id || 0) === Number(userId)) {
       await connection.rollback();
       return res.status(400).json({ message: "You already own this coin" });
     }
 
-    if (currentPrice <= 0) {
-      await connection.rollback();
-      return res.status(400).json({ message: "Coin is not available for purchase" });
-    }
-
+    const price = Number(coin.current_price || 100);
     const balance = await getUserBalance(connection, userId);
 
-    if (balance < currentPrice) {
+    if (balance < price) {
       await connection.rollback();
-      return res.status(400).json({ message: `Insufficient balance. You need ${currentPrice - balance} more O².` });
+      return res.status(400).json({ message: "Insufficient balance" });
     }
 
     await insertTransaction(connection, {
       user_id: userId,
       created_by_user_id: userId,
+      session_id: null,
       type: "COIN_PURCHASE",
       direction: "DEBIT",
-      amount: currentPrice,
+      amount: price,
       from_unit: "DOUBLE_O",
-      to_unit: null,
-      note: `Bought coin: ${coin.title}`,
+      to_unit: "COIN",
+      note: `Bought treasure coin: ${coin.title}`,
     });
 
-    if (status === "PAID_OWNED" && currentOwnerId && currentOwnerId !== userId) {
-      const refundAmount = Number(state.last_purchase_price || 0);
+    const usersToClear = [];
+
+    if (coin.status === "PAID_OWNED" && coin.owner_user_id) {
+      const refundAmount = Number(coin.last_purchase_price || 0);
 
       if (refundAmount > 0) {
         await insertTransaction(connection, {
-          user_id: currentOwnerId,
+          user_id: coin.owner_user_id,
           created_by_user_id: userId,
-          type: "COIN_OWNER_REFUND",
+          session_id: null,
+          type: "COIN_REFUND",
           direction: "CREDIT",
           amount: refundAmount,
-          from_unit: null,
+          from_unit: "COIN",
           to_unit: "DOUBLE_O",
-          note: `Refund for ${coin.title}: bought by another player`,
+          note: `Refund for ${coin.title} because it was bought by another player`,
         });
       }
+
+      usersToClear.push(Number(coin.owner_user_id));
     }
 
-    if (status === "FOR_SALE" && state.sale_seller_user_id) {
-      const sellerId = Number(state.sale_seller_user_id);
-      const remainingRefund = Math.max(0, Number(state.sale_original_price || 0) - Number(state.sale_paid_upfront || 0));
+    if (coin.status === "FOR_SALE" && coin.sale_seller_user_id) {
+      const finalRefund = Math.max(0, Number(coin.sale_original_price || 0) - Number(coin.sale_paid_upfront || 0));
 
-      if (sellerId !== userId && remainingRefund > 0) {
+      if (finalRefund > 0) {
         await insertTransaction(connection, {
-          user_id: sellerId,
+          user_id: coin.sale_seller_user_id,
           created_by_user_id: userId,
+          session_id: null,
           type: "COIN_SALE_FINAL_REFUND",
           direction: "CREDIT",
-          amount: remainingRefund,
-          from_unit: null,
+          amount: finalRefund,
+          from_unit: "COIN",
           to_unit: "DOUBLE_O",
           note: `Final sale refund for ${coin.title}`,
         });
       }
+
+      usersToClear.push(Number(coin.sale_seller_user_id));
     }
+
+    await clearSelectedSpecialCoin(connection, usersToClear, coinId);
 
     await connection.execute(
       `
@@ -383,11 +309,10 @@ async function buyCoin(req, res) {
         sale_original_price = NULL,
         sale_seller_user_id = NULL,
         sale_paid_upfront = 0,
-        locked_forever = 0,
-        updated_at = NOW()
+        locked_forever = 0
       WHERE coin_id = ?
       `,
-      [userId, currentPrice + PRICE_STEP, currentPrice, coinId],
+      [userId, price + 50, price, coinId],
     );
 
     await connection.commit();
@@ -395,8 +320,8 @@ async function buyCoin(req, res) {
     res.json({
       message: "Coin bought successfully",
       coinId,
-      paid: currentPrice,
-      nextPrice: currentPrice + PRICE_STEP,
+      paid: price,
+      nextPrice: price + 50,
     });
   } catch (error) {
     await connection.rollback();
@@ -419,38 +344,64 @@ async function listCoinForSale(req, res) {
     }
 
     await connection.beginTransaction();
+    await ensureMarketRows(connection);
 
-    const data = await getActiveCoinForUpdate(connection, coinId);
+    const [rows] = await connection.execute(
+      `
+      SELECT
+        cc.id,
+        cc.title,
+        cms.status,
+        cms.owner_user_id,
+        cms.last_purchase_price,
+        cms.locked_forever
+      FROM coin_catalog cc
+      JOIN coin_market_state cms ON cms.coin_id = cc.id
+      WHERE cc.id = ? AND cc.is_active = 1
+      FOR UPDATE
+      `,
+      [coinId],
+    );
 
-    if (!data) {
+    if (rows.length === 0) {
       await connection.rollback();
       return res.status(404).json({ message: "Coin not found" });
     }
 
-    const { coin, state } = data;
-    const status = normalizeStatus(state.status);
-    const currentOwnerId = state.owner_user_id === null ? null : Number(state.owner_user_id);
-    const purchasePrice = Number(state.last_purchase_price || 0);
+    const coin = rows[0];
 
-    if (status !== "PAID_OWNED" || currentOwnerId !== userId || purchasePrice <= 0) {
+    if (coin.status !== "PAID_OWNED" || Number(coin.owner_user_id || 0) !== Number(userId)) {
       await connection.rollback();
-      return res.status(400).json({ message: "You can list only a coin you bought from the Treasure Room" });
+      return res.status(400).json({ message: "You can only list paid coins that you currently own" });
     }
 
-    const upfrontRefund = Math.floor(purchasePrice / 2);
-
-    if (upfrontRefund > 0) {
-      await insertTransaction(connection, {
-        user_id: userId,
-        created_by_user_id: userId,
-        type: "COIN_LIST_FOR_SALE",
-        direction: "CREDIT",
-        amount: upfrontRefund,
-        from_unit: null,
-        to_unit: "DOUBLE_O",
-        note: `Listed ${coin.title} for sale`,
-      });
+    if (coin.locked_forever) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Exclusive coins cannot be listed for sale" });
     }
+
+    const originalPrice = Number(coin.last_purchase_price || 0);
+
+    if (originalPrice <= 0) {
+      await connection.rollback();
+      return res.status(400).json({ message: "This coin cannot be listed" });
+    }
+
+    const upfront = Math.floor(originalPrice / 2);
+
+    await insertTransaction(connection, {
+      user_id: userId,
+      created_by_user_id: userId,
+      session_id: null,
+      type: "COIN_LIST_FOR_SALE",
+      direction: "CREDIT",
+      amount: upfront,
+      from_unit: "COIN",
+      to_unit: "DOUBLE_O",
+      note: `Listed treasure coin for sale: ${coin.title}`,
+    });
+
+    await clearSelectedSpecialCoin(connection, [userId], coinId);
 
     await connection.execute(
       `
@@ -462,11 +413,10 @@ async function listCoinForSale(req, res) {
         sale_original_price = ?,
         sale_seller_user_id = ?,
         sale_paid_upfront = ?,
-        locked_forever = 0,
-        updated_at = NOW()
+        locked_forever = 0
       WHERE coin_id = ?
       `,
-      [upfrontRefund, purchasePrice, userId, upfrontRefund, coinId],
+      [upfront, originalPrice, userId, upfront, coinId],
     );
 
     await connection.commit();
@@ -474,13 +424,13 @@ async function listCoinForSale(req, res) {
     res.json({
       message: "Coin listed for sale",
       coinId,
-      upfrontRefund,
-      salePrice: upfrontRefund,
+      upfront,
+      price: upfront,
     });
   } catch (error) {
     await connection.rollback();
     console.error("listCoinForSale error:", error);
-    res.status(500).json({ message: "Failed to list coin for sale" });
+    res.status(500).json({ message: "Failed to list coin" });
   } finally {
     connection.release();
   }
@@ -498,21 +448,39 @@ async function requestExclusiveOwnership(req, res) {
     }
 
     await connection.beginTransaction();
+    await ensureMarketRows(connection);
 
-    const data = await getActiveCoinForUpdate(connection, coinId);
+    const [rows] = await connection.execute(
+      `
+      SELECT
+        cc.id,
+        cc.title,
+        cms.status,
+        cms.owner_user_id,
+        cms.locked_forever
+      FROM coin_catalog cc
+      JOIN coin_market_state cms ON cms.coin_id = cc.id
+      WHERE cc.id = ? AND cc.is_active = 1
+      FOR UPDATE
+      `,
+      [coinId],
+    );
 
-    if (!data) {
+    if (rows.length === 0) {
       await connection.rollback();
       return res.status(404).json({ message: "Coin not found" });
     }
 
-    const { state } = data;
-    const status = normalizeStatus(state.status);
-    const ownerUserId = state.owner_user_id === null ? null : Number(state.owner_user_id);
+    const coin = rows[0];
 
-    if (status === "EXCLUSIVE_LOCKED" || Number(state.locked_forever || 0) === 1) {
+    if (coin.status === "EXCLUSIVE_LOCKED" || coin.locked_forever) {
       await connection.rollback();
       return res.status(400).json({ message: "This coin is already exclusive" });
+    }
+
+    if (Number(coin.owner_user_id || 0) === Number(userId) && coin.status !== "PAID_OWNED") {
+      await connection.rollback();
+      return res.status(400).json({ message: "You already own this coin" });
     }
 
     const [pendingRows] = await connection.execute(
@@ -541,9 +509,10 @@ async function requestExclusiveOwnership(req, res) {
 
     await connection.commit();
 
-    res.status(201).json({
+    res.json({
       message: "Exclusive ownership request sent",
-      requestId: result.insertId,
+      requestId: Number(result.insertId),
+      coinId,
     });
   } catch (error) {
     await connection.rollback();
@@ -556,9 +525,6 @@ async function requestExclusiveOwnership(req, res) {
 
 module.exports = {
   getCoins,
-  getMyCoinCollection,
-  getUserCoinCollection,
-  updateSelectedCoins,
   buyCoin,
   listCoinForSale,
   requestExclusiveOwnership,

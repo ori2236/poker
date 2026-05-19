@@ -2,12 +2,26 @@ import fs from "fs";
 import path from "path";
 import pool from "../src/config/db.js";
 
-const coinsDir = "C:\\Users\\ORI\\Desktop\\doubleO\\coins";
+const sourceCoinsDir = "C:\\Users\\ORI\\Desktop\\doubleO\\coins";
 
-// אם אתה רוצה שגם שמות הקבצים עצמם בתיקייה ישתנו ל-coin-1.png וכו׳,
-// תשנה ל-true.
-// כרגע זה משנה את השמות ב-DB בלבד, שזה מה שבאמת חשוב לאפליקציה.
-const RENAME_FILES_ON_DISK = true;
+// נוציא את התמונות עם שמות חדשים לתיקייה חדשה, כדי לא לדרוס שום קובץ מקורי
+const outputBaseDir = "C:\\Users\\ORI\\Desktop\\doubleO";
+
+// מוחק את המטבעות הישנים מה-DB לפני העלאה מחדש
+const DELETE_OLD_COINS_FROM_DB = true;
+
+function getTimestamp() {
+  const now = new Date();
+
+  const pad = (value) => String(value).padStart(2, "0");
+
+  return [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`,
+  ].join("-");
+}
 
 function getMimeType(filename) {
   const ext = path.extname(filename).toLowerCase();
@@ -25,47 +39,102 @@ function getSafeExt(filename) {
   return ".png";
 }
 
-async function reimportCoins() {
+function assertDirectoryExists(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    throw new Error(`Folder does not exist: ${dirPath}`);
+  }
+
+  const stat = fs.statSync(dirPath);
+
+  if (!stat.isDirectory()) {
+    throw new Error(`Path is not a folder: ${dirPath}`);
+  }
+}
+
+async function safeReimportCoins() {
+  const timestamp = getTimestamp();
+  const renamedCoinsDir = path.join(
+    outputBaseDir,
+    `coins-renamed-${timestamp}`,
+  );
+
+  assertDirectoryExists(sourceCoinsDir);
+
+  const sourceFiles = fs
+    .readdirSync(sourceCoinsDir)
+    .filter((file) => /\.(png|jpg|jpeg|webp)$/i.test(file))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+  if (sourceFiles.length === 0) {
+    console.log("No image files found in:", sourceCoinsDir);
+    return;
+  }
+
+  if (fs.existsSync(renamedCoinsDir)) {
+    throw new Error(
+      `Output folder already exists, stopping to avoid overwrite: ${renamedCoinsDir}`,
+    );
+  }
+
+  fs.mkdirSync(renamedCoinsDir, { recursive: false });
+
+  console.log("Source folder:");
+  console.log(sourceCoinsDir);
+  console.log("");
+  console.log("New renamed copies folder:");
+  console.log(renamedCoinsDir);
+  console.log("");
+
+  const renamedFiles = [];
+
+  for (let i = 0; i < sourceFiles.length; i++) {
+    const originalFile = sourceFiles[i];
+    const coinNumber = i + 1;
+    const coinName = `coin-${coinNumber}`;
+    const ext = getSafeExt(originalFile);
+
+    const originalPath = path.join(sourceCoinsDir, originalFile);
+    const newFileName = `${coinName}${ext}`;
+    const newPath = path.join(renamedCoinsDir, newFileName);
+
+    if (fs.existsSync(newPath)) {
+      throw new Error(
+        `Target file already exists, stopping to avoid overwrite: ${newPath}`,
+      );
+    }
+
+    // חשוב: copyFileSync ולא renameSync
+    // זה לא מוחק ולא דורס את הקבצים המקוריים
+    fs.copyFileSync(originalPath, newPath);
+
+    renamedFiles.push({
+      coinNumber,
+      coinName,
+      originalFile,
+      newFileName,
+      newPath,
+      imageMime: getMimeType(newFileName),
+    });
+
+    console.log(`Copied: ${originalFile}  ->  ${newFileName}`);
+  }
+
   const connection = await pool.getConnection();
 
   try {
-    const files = fs
-      .readdirSync(coinsDir)
-      .filter((file) => /\.(png|jpg|jpeg|webp)$/i.test(file))
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-
-    if (files.length === 0) {
-      console.log("No image files found in:", coinsDir);
-      return;
-    }
-
     await connection.beginTransaction();
 
-    console.log("Deleting old coins from coin_catalog...");
-    await connection.query("DELETE FROM coin_catalog");
+    if (DELETE_OLD_COINS_FROM_DB) {
+      console.log("");
+      console.log("Deleting old coins from coin_catalog...");
+      await connection.query("DELETE FROM coin_catalog");
+    }
 
-    for (let i = 0; i < files.length; i++) {
-      const originalFile = files[i];
-      const coinNumber = i + 1;
-      const coinName = `coin-${coinNumber}`;
-      const originalPath = path.join(coinsDir, originalFile);
-      const ext = getSafeExt(originalFile);
+    console.log("");
+    console.log("Uploading coins to DB...");
 
-      let filePathToRead = originalPath;
-
-      if (RENAME_FILES_ON_DISK) {
-        const newFileName = `${coinName}${ext}`;
-        const newPath = path.join(coinsDir, newFileName);
-
-        if (originalPath !== newPath) {
-          fs.renameSync(originalPath, newPath);
-        }
-
-        filePathToRead = newPath;
-      }
-
-      const imageMime = getMimeType(filePathToRead);
-      const imageBase64 = fs.readFileSync(filePathToRead).toString("base64");
+    for (const coin of renamedFiles) {
+      const imageBase64 = fs.readFileSync(coin.newPath).toString("base64");
 
       await connection.query(
         `
@@ -84,29 +153,35 @@ async function reimportCoins() {
           (?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
-          coinName,
-          coinName,
+          coin.coinName,
+          coin.coinName,
           null,
           "CUSTOM",
-          imageMime,
+          coin.imageMime,
           imageBase64,
           1,
-          coinNumber,
+          coin.coinNumber,
         ],
       );
 
-      console.log(`Imported ${coinName} from ${path.basename(filePathToRead)}`);
+      console.log(`Uploaded: ${coin.coinName}`);
     }
 
     await connection.commit();
 
     console.log("");
-    console.log(
-      `Done. Deleted old coins and imported ${files.length} new coins.`,
-    );
+    console.log("Done.");
+    console.log(`Created renamed copies in: ${renamedCoinsDir}`);
+    console.log(`Uploaded ${renamedFiles.length} coins to DB.`);
+    console.log("");
+    console.log("Original files were NOT changed.");
   } catch (error) {
     await connection.rollback();
-    console.error("Failed to reimport coins:", error);
+
+    console.error("");
+    console.error("Failed to upload coins. DB changes were rolled back.");
+    console.error(error);
+
     process.exitCode = 1;
   } finally {
     connection.release();
@@ -114,4 +189,9 @@ async function reimportCoins() {
   }
 }
 
-reimportCoins();
+safeReimportCoins().catch((error) => {
+  console.error("");
+  console.error("Script failed before DB upload:");
+  console.error(error);
+  process.exitCode = 1;
+});

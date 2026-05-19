@@ -1,5 +1,5 @@
 const db = require("../config/db");
-const { getOwnedSpecialCoinsForUserIds } = require("../utils/coinUtils");
+const { attachSpecialCoins } = require("../utils/coinHelpers");
 
 async function getMyBalance(req, res) {
   try {
@@ -92,30 +92,26 @@ async function getLeaderboard(req, res) {
       ORDER BY balance DESC, balance_held_since ASC, u.created_at ASC, u.username ASC
     `);
 
-    const specialCoinsByUserId = await getOwnedSpecialCoinsForUserIds(
-      db,
-      rows.map((row) => row.id),
-    );
+    const normalizedRows = rows.map((row, index) => ({
+      rank: index + 1,
+      id: Number(row.id),
+      username: row.username,
+      profile_image_base64: row.profile_image_base64,
+      secondary_profile_image_base64: row.secondary_profile_image_base64,
+      balance: Number(row.balance),
+      todayNet: Number(row.today_net),
+      card_hand: row.card_hand || "HIGH_CARD",
 
-    res.json(
-      rows.map((row, index) => ({
-        rank: index + 1,
-        id: Number(row.id),
-        username: row.username,
-        profile_image_base64: row.profile_image_base64,
-        secondary_profile_image_base64: row.secondary_profile_image_base64,
-        balance: Number(row.balance),
-        todayNet: Number(row.today_net),
-        card_hand: row.card_hand || "HIGH_CARD",
+      // חשוב: משאירים null אם המשתמש בחר בלי מטבעות / מטבע אחד.
+      selected_coin_1: row.selected_coin_1,
+      selected_coin_2: row.selected_coin_2,
 
-        // חשוב: משאירים null אם המשתמש בחר בלי מטבעות / מטבע אחד.
-        selected_coin_1: row.selected_coin_1,
-        selected_coin_2: row.selected_coin_2,
+      is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
+    }));
 
-        is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
-        special_coins: specialCoinsByUserId.get(Number(row.id)) || [],
-      })),
-    );
+    const rowsWithCoins = await attachSpecialCoins(db, normalizedRows, "id");
+
+    res.json(rowsWithCoins);
   } catch (error) {
     console.error("getLeaderboard error:", error);
     res.status(500).json({ message: "Server error" });

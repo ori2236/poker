@@ -1,5 +1,5 @@
 const db = require("../config/db");
-const { getOwnedSpecialCoinsForUserIds } = require("../utils/coinUtils");
+const { attachSpecialCoins } = require("../utils/coinHelpers");
 
 function calculateAmountFromBreakdown({
   white_count = 0,
@@ -387,13 +387,6 @@ async function getActiveSession(req, res) {
       [session.id],
     );
 
-    const sessionUserIds = [
-      ...players.map((row) => row.user_id),
-      ...waitingBuyIns.map((row) => row.user_id),
-      ...waitingCashOuts.map((row) => row.user_id),
-    ];
-    const specialCoinsByUserId = await getOwnedSpecialCoinsForUserIds(db, sessionUserIds);
-
     const normalizedPlayers = players.map((row) => ({
       user_id: Number(row.user_id),
       username: row.username,
@@ -403,7 +396,6 @@ async function getActiveSession(req, res) {
       selected_coin_1: row.selected_coin_1,
       selected_coin_2: row.selected_coin_2,
       is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
-      special_coins: specialCoinsByUserId.get(Number(row.user_id)) || [],
       buy_in_total: Number(row.buy_in_total || 0),
       stack_amount: Number(row.stack_amount || 0),
     }));
@@ -418,7 +410,6 @@ async function getActiveSession(req, res) {
       selected_coin_1: row.selected_coin_1,
       selected_coin_2: row.selected_coin_2,
       is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
-      special_coins: specialCoinsByUserId.get(Number(row.user_id)) || [],
       amount_mode: row.amount_mode,
       amount_total: Number(row.amount_total || 0),
       status: row.status,
@@ -439,7 +430,6 @@ async function getActiveSession(req, res) {
         selected_coin_1: row.selected_coin_1,
         selected_coin_2: row.selected_coin_2,
         is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
-        special_coins: specialCoinsByUserId.get(Number(row.user_id)) || [],
         amount_mode: row.amount_mode,
         amount_total: amountTotal,
         buy_in_total: buyInTotal,
@@ -450,13 +440,17 @@ async function getActiveSession(req, res) {
       };
     });
 
+    const playersWithCoins = await attachSpecialCoins(db, normalizedPlayers, "user_id");
+    const waitingBuyInsWithCoins = await attachSpecialCoins(db, normalizedWaitingBuyIns, "user_id");
+    const waitingCashOutsWithCoins = await attachSpecialCoins(db, normalizedWaitingCashOuts, "user_id");
+
     res.json({
       activeSession: {
         ...session,
-        players: normalizedPlayers,
-        waitingBuyIns: normalizedWaitingBuyIns,
-        waitingCashOuts: normalizedWaitingCashOuts,
-        pendingRequests: [...normalizedWaitingBuyIns, ...normalizedWaitingCashOuts],
+        players: playersWithCoins,
+        waitingBuyIns: waitingBuyInsWithCoins,
+        waitingCashOuts: waitingCashOutsWithCoins,
+        pendingRequests: [...waitingBuyInsWithCoins, ...waitingCashOutsWithCoins],
         myPendingRequest: myPendingRows[0]
           ? {
               ...myPendingRows[0],

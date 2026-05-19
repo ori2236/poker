@@ -1,6 +1,6 @@
 const db = require("../config/db");
 const bcrypt = require("bcrypt");
-const { getOwnedSpecialCoinsForUserIds } = require("../utils/coinUtils");
+const { attachSpecialCoins, validateSelectedCoins } = require("../utils/coinHelpers");
 
 const CARD_HANDS = [
   "HIGH_CARD",
@@ -57,25 +57,21 @@ async function getAllUsers(req, res) {
       ORDER BY username ASC
     `);
 
-    const specialCoinsByUserId = await getOwnedSpecialCoinsForUserIds(
-      db,
-      rows.map((row) => row.id),
-    );
+    const normalizedRows = rows.map((row) => ({
+      ...row,
+      id: Number(row.id),
+      is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
+      card_hand: row.card_hand || "HIGH_CARD",
 
-    res.json(
-      rows.map((row) => ({
-        ...row,
-        id: Number(row.id),
-        is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
-        card_hand: row.card_hand || "HIGH_CARD",
+      // חשוב: לא מחזירים כאן APP/CARD כברירת מחדל,
+      // כדי ש-Clear All ומטבע אחד בלבד יעבדו באמת.
+      selected_coin_1: row.selected_coin_1,
+      selected_coin_2: row.selected_coin_2,
+    }));
 
-        // חשוב: לא מחזירים כאן APP/CARD כברירת מחדל,
-        // כדי ש-Clear All ומטבע אחד בלבד יעבדו באמת.
-        selected_coin_1: row.selected_coin_1,
-        selected_coin_2: row.selected_coin_2,
-        special_coins: specialCoinsByUserId.get(Number(row.id)) || [],
-      })),
-    );
+    const rowsWithCoins = await attachSpecialCoins(db, normalizedRows, "id");
+
+    res.json(rowsWithCoins);
   } catch (error) {
     console.error("getAllUsers error:", error);
     res.status(500).json({ message: "Server error" });
@@ -193,18 +189,16 @@ async function updateMySelectedCoins(req, res) {
     const userId = req.user.id;
     const { selectedCoin1, selectedCoin2 } = req.body;
 
-    const firstCoin = normalizeSelectedCoin(selectedCoin1);
-    const secondCoin = normalizeSelectedCoin(selectedCoin2);
+    let validated;
 
-    if (firstCoin === undefined || secondCoin === undefined) {
-      return res.status(400).json({ message: "Invalid coin selection" });
+    try {
+      validated = await validateSelectedCoins(db, userId, selectedCoin1, selectedCoin2);
+    } catch (validationError) {
+      return res.status(400).json({ message: validationError.message || "Invalid coin selection" });
     }
 
-    if (firstCoin && secondCoin && firstCoin === secondCoin) {
-      return res
-        .status(400)
-        .json({ message: "Cannot select the same coin twice" });
-    }
+    const firstCoin = validated.firstCoin;
+    const secondCoin = validated.secondCoin;
 
     await db.execute(
       `
@@ -349,6 +343,55 @@ async function deleteUser(req, res) {
       WHERE user_id = ? AND status = 'PENDING'
       `,
       [adminUserId, targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE coin_requests
+      SET status = 'REJECTED', admin_user_id = ?, admin_decision_at = NOW()
+      WHERE user_id = ? AND status = 'PENDING'
+      `,
+      [adminUserId, targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE coin_market_state
+      SET
+        status = 'AVAILABLE',
+        owner_user_id = NULL,
+        locked_forever = 0,
+        last_purchase_price = NULL,
+        sale_original_price = NULL,
+        sale_seller_user_id = NULL,
+        sale_paid_upfront = 0,
+        current_price = CASE WHEN current_price IS NULL OR current_price < 100 THEN 100 ELSE current_price END
+      WHERE owner_user_id = ?
+      `,
+      [targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE coin_market_state
+      SET
+        status = 'AVAILABLE',
+        sale_original_price = NULL,
+        sale_seller_user_id = NULL,
+        sale_paid_upfront = 0,
+        current_price = CASE WHEN current_price IS NULL OR current_price < 100 THEN 100 ELSE current_price END
+      WHERE sale_seller_user_id = ?
+      `,
+      [targetUserId],
+    );
+
+    await connection.execute(
+      `
+      UPDATE users
+      SET selected_coin_1 = NULL, selected_coin_2 = NULL
+      WHERE id = ?
+      `,
+      [targetUserId],
     );
 
     await connection.commit();

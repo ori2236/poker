@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { clearSelectedSpecialCoin } = require("../utils/coinHelpers");
 
 async function insertTransaction(connection, data) {
   await connection.execute(
@@ -31,36 +32,6 @@ async function insertTransaction(connection, data) {
   );
 }
 
-function normalizeCoinStatus(value) {
-  if (value === "PAID_OWNED" || value === "FOR_SALE" || value === "EXCLUSIVE_LOCKED") {
-    return value;
-  }
-  return "AVAILABLE";
-}
-
-async function ensureCoinMarketState(connection, coinId) {
-  await connection.execute(
-    `
-    INSERT IGNORE INTO coin_market_state (coin_id, status, current_price)
-    VALUES (?, 'AVAILABLE', 100)
-    `,
-    [coinId],
-  );
-
-  const [rows] = await connection.execute(
-    `
-    SELECT *
-    FROM coin_market_state
-    WHERE coin_id = ?
-    LIMIT 1
-    FOR UPDATE
-    `,
-    [coinId],
-  );
-
-  return rows[0] || null;
-}
-
 async function getPendingRequests(req, res) {
   try {
     const [conversionRows] = await db.execute(
@@ -71,9 +42,6 @@ async function getPendingRequests(req, res) {
         u.username,
         cr.type AS conversion_type,
         NULL AS bonus_title,
-        NULL AS coin_title,
-        NULL AS coin_image_mime,
-        NULL AS coin_image_base64,
         cr.amount_total,
         cr.created_at
       FROM conversion_requests cr
@@ -90,9 +58,6 @@ async function getPendingRequests(req, res) {
         u.username,
         NULL AS conversion_type,
         b.title AS bonus_title,
-        NULL AS coin_title,
-        NULL AS coin_image_mime,
-        NULL AS coin_image_base64,
         br.amount_snapshot AS amount_total,
         br.created_at
       FROM bonus_requests br
@@ -105,7 +70,7 @@ async function getPendingRequests(req, res) {
     const [coinRows] = await db.execute(
       `
       SELECT
-        cr.id,
+        cor.id,
         'COIN' AS request_kind,
         u.username,
         NULL AS conversion_type,
@@ -114,11 +79,12 @@ async function getPendingRequests(req, res) {
         cc.image_mime AS coin_image_mime,
         cc.image_base64 AS coin_image_base64,
         0 AS amount_total,
-        cr.created_at
-      FROM coin_requests cr
-      JOIN users u ON u.id = cr.user_id
-      JOIN coin_catalog cc ON cc.id = cr.coin_id
-      WHERE cr.status = 'PENDING'
+        cor.created_at
+      FROM coin_requests cor
+      JOIN users u ON u.id = cor.user_id
+      JOIN coin_catalog cc ON cc.id = cor.coin_id
+      WHERE cor.status = 'PENDING'
+        AND cc.is_active = 1
       `,
     );
 
@@ -136,9 +102,9 @@ async function getPendingRequests(req, res) {
         username: row.username,
         conversion_type: row.conversion_type,
         bonus_title: row.bonus_title,
-        coin_title: row.coin_title,
-        coin_image_mime: row.coin_image_mime,
-        coin_image_base64: row.coin_image_base64,
+        coin_title: row.coin_title || null,
+        coin_image_mime: row.coin_image_mime || null,
+        coin_image_base64: row.coin_image_base64 || null,
         amount_total: Number(row.amount_total || 0),
         created_at: row.created_at,
       })),
@@ -274,6 +240,7 @@ async function rejectBonusRequest(req, res) {
   }
 }
 
+
 async function approveCoinRequest(req, res) {
   const connection = await db.getConnection();
 
@@ -290,14 +257,16 @@ async function approveCoinRequest(req, res) {
     const [requestRows] = await connection.execute(
       `
       SELECT
-        cr.*,
-        cc.title AS coin_title,
-        u.username AS requester_username
-      FROM coin_requests cr
-      JOIN coin_catalog cc ON cc.id = cr.coin_id
-      JOIN users u ON u.id = cr.user_id
-      WHERE cr.id = ?
-      LIMIT 1
+        cor.id,
+        cor.coin_id,
+        cor.user_id,
+        cor.status,
+        u.username,
+        cc.title AS coin_title
+      FROM coin_requests cor
+      JOIN users u ON u.id = cor.user_id AND u.is_active = 1
+      JOIN coin_catalog cc ON cc.id = cor.coin_id AND cc.is_active = 1
+      WHERE cor.id = ?
       FOR UPDATE
       `,
       [requestId],
@@ -315,51 +284,84 @@ async function approveCoinRequest(req, res) {
       return res.status(400).json({ message: "Request already handled" });
     }
 
-    const market = await ensureCoinMarketState(connection, request.coin_id);
-    const status = normalizeCoinStatus(market.status);
+    const [marketRows] = await connection.execute(
+      `
+      SELECT
+        coin_id,
+        status,
+        owner_user_id,
+        current_price,
+        last_purchase_price,
+        sale_original_price,
+        sale_seller_user_id,
+        sale_paid_upfront,
+        locked_forever
+      FROM coin_market_state
+      WHERE coin_id = ?
+      FOR UPDATE
+      `,
+      [request.coin_id],
+    );
 
-    if (status === "EXCLUSIVE_LOCKED" || Number(market.locked_forever || 0) === 1) {
+    if (marketRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Coin market state not found" });
+    }
+
+    const market = marketRows[0];
+
+    if (market.status === "EXCLUSIVE_LOCKED" || market.locked_forever) {
       await connection.rollback();
       return res.status(400).json({ message: "This coin is already exclusive" });
     }
 
-    if (status === "PAID_OWNED" && market.owner_user_id) {
-      const ownerId = Number(market.owner_user_id);
+    const usersToClear = [];
+
+    if (market.status === "PAID_OWNED" && market.owner_user_id) {
       const refundAmount = Number(market.last_purchase_price || 0);
 
       if (refundAmount > 0) {
         await insertTransaction(connection, {
-          user_id: ownerId,
+          user_id: market.owner_user_id,
           created_by_user_id: adminUserId,
           session_id: null,
           type: "COIN_EXCLUSIVE_REFUND",
           direction: "CREDIT",
           amount: refundAmount,
-          from_unit: null,
+          from_unit: "COIN",
           to_unit: "DOUBLE_O",
-          note: `Full refund for ${request.coin_title}: exclusive ownership approved`,
+          note: `Refund for ${request.coin_title} because exclusive ownership was approved`,
         });
+      }
+
+      if (Number(market.owner_user_id) !== Number(request.user_id)) {
+        usersToClear.push(Number(market.owner_user_id));
       }
     }
 
-    if (status === "FOR_SALE" && market.sale_seller_user_id) {
-      const sellerId = Number(market.sale_seller_user_id);
-      const remainingRefund = Math.max(0, Number(market.sale_original_price || 0) - Number(market.sale_paid_upfront || 0));
+    if (market.status === "FOR_SALE" && market.sale_seller_user_id) {
+      const finalRefund = Math.max(0, Number(market.sale_original_price || 0) - Number(market.sale_paid_upfront || 0));
 
-      if (remainingRefund > 0) {
+      if (finalRefund > 0) {
         await insertTransaction(connection, {
-          user_id: sellerId,
+          user_id: market.sale_seller_user_id,
           created_by_user_id: adminUserId,
           session_id: null,
           type: "COIN_EXCLUSIVE_REFUND",
           direction: "CREDIT",
-          amount: remainingRefund,
-          from_unit: null,
+          amount: finalRefund,
+          from_unit: "COIN",
           to_unit: "DOUBLE_O",
-          note: `Remaining refund for ${request.coin_title}: exclusive ownership approved`,
+          note: `Final refund for ${request.coin_title} because exclusive ownership was approved`,
         });
       }
+
+      if (Number(market.sale_seller_user_id) !== Number(request.user_id)) {
+        usersToClear.push(Number(market.sale_seller_user_id));
+      }
     }
+
+    await clearSelectedSpecialCoin(connection, usersToClear, request.coin_id);
 
     await insertTransaction(connection, {
       user_id: request.user_id,
@@ -368,8 +370,8 @@ async function approveCoinRequest(req, res) {
       type: "COIN_EXCLUSIVE_GRANTED",
       direction: "CREDIT",
       amount: 0,
-      from_unit: null,
-      to_unit: "DOUBLE_O",
+      from_unit: "COIN",
+      to_unit: "COIN",
       note: `Exclusive ownership approved: ${request.coin_title}`,
     });
 
@@ -379,13 +381,11 @@ async function approveCoinRequest(req, res) {
       SET
         status = 'EXCLUSIVE_LOCKED',
         owner_user_id = ?,
-        current_price = 0,
+        locked_forever = 1,
         last_purchase_price = NULL,
         sale_original_price = NULL,
         sale_seller_user_id = NULL,
-        sale_paid_upfront = 0,
-        locked_forever = 1,
-        updated_at = NOW()
+        sale_paid_upfront = 0
       WHERE coin_id = ?
       `,
       [request.user_id, request.coin_id],
@@ -423,7 +423,6 @@ async function approveCoinRequest(req, res) {
       message: "Exclusive ownership approved successfully",
       requestId,
       coinId: Number(request.coin_id),
-      userId: Number(request.user_id),
     });
   } catch (error) {
     await connection.rollback();
@@ -493,16 +492,12 @@ async function getRequestHistory(req, res) {
     const conversionConditions = [];
     const bonusParams = [];
     const bonusConditions = [];
-    const coinParams = [];
-    const coinConditions = [];
 
     if (scope === "mine") {
       conversionConditions.push("cr.user_id = ?");
       conversionParams.push(req.user.id);
       bonusConditions.push("br.user_id = ?");
       bonusParams.push(req.user.id);
-      coinConditions.push("cor.user_id = ?");
-      coinParams.push(req.user.id);
     }
 
     if (["PENDING", "APPROVED", "REJECTED"].includes(status)) {
@@ -510,21 +505,19 @@ async function getRequestHistory(req, res) {
       conversionParams.push(status);
       bonusConditions.push("br.status = ?");
       bonusParams.push(status);
-      coinConditions.push("cor.status = ?");
-      coinParams.push(status);
     }
 
     if (type === "buy_in") {
       conversionConditions.push("cr.type = 'TO_CHIPS'");
     } else if (type === "cash_out") {
       conversionConditions.push("cr.type = 'TO_COINS'");
-    } else if (!["all", "bonus", "coin"].includes(type)) {
+    } else if (type !== "all" && type !== "bonus") {
       return res.status(400).json({ message: "Invalid type filter" });
     }
 
     const items = [];
 
-    if (!["bonus", "coin"].includes(type)) {
+    if (type !== "bonus") {
       const conversionWhereClause = conversionConditions.length
         ? `WHERE ${conversionConditions.join(" AND ")}`
         : "";
@@ -549,8 +542,7 @@ async function getRequestHistory(req, res) {
           cr.admin_decision_at,
           cr.admin_user_id,
           au.username AS admin_username,
-          NULL AS bonus_title,
-          NULL AS coin_title
+          NULL AS bonus_title
         FROM conversion_requests cr
         JOIN users u ON u.id = cr.user_id
         LEFT JOIN users au ON au.id = cr.admin_user_id
@@ -586,7 +578,6 @@ async function getRequestHistory(req, res) {
           br.user_id,
           u.username,
           NULL AS session_id,
-          NULL AS session_title,
           br.amount_snapshot AS amount,
           br.status,
           CONCAT('Bonus request: ', b.title) AS note,
@@ -594,8 +585,7 @@ async function getRequestHistory(req, res) {
           br.admin_decision_at,
           br.admin_user_id,
           au.username AS admin_username,
-          b.title AS bonus_title,
-          NULL AS coin_title
+          b.title AS bonus_title
         FROM bonus_requests br
         JOIN users u ON u.id = br.user_id
         JOIN bonuses b ON b.id = br.bonus_id
@@ -607,51 +597,6 @@ async function getRequestHistory(req, res) {
 
       items.push(
         ...bonusRows.map((row) => ({
-          ...row,
-          user_id: Number(row.user_id),
-          session_id: null,
-          session_title: null,
-          amount: Number(row.amount),
-          admin_user_id: row.admin_user_id === null ? null : Number(row.admin_user_id),
-        })),
-      );
-    }
-
-    if (type === "all" || type === "coin") {
-      const coinWhereClause = coinConditions.length
-        ? `WHERE ${coinConditions.join(" AND ")}`
-        : "";
-
-      const [coinRows] = await db.execute(
-        `
-        SELECT
-          CONCAT('coin-', cor.id) AS id,
-          'COIN' AS source_kind,
-          'COIN_EXCLUSIVE_REQUEST' AS action_type,
-          cor.user_id,
-          u.username,
-          NULL AS session_id,
-          NULL AS session_title,
-          0 AS amount,
-          cor.status,
-          CONCAT('Exclusive ownership request: ', cc.title) AS note,
-          cor.created_at,
-          cor.admin_decision_at,
-          cor.admin_user_id,
-          au.username AS admin_username,
-          NULL AS bonus_title,
-          cc.title AS coin_title
-        FROM coin_requests cor
-        JOIN users u ON u.id = cor.user_id
-        JOIN coin_catalog cc ON cc.id = cor.coin_id
-        LEFT JOIN users au ON au.id = cor.admin_user_id
-        ${coinWhereClause}
-        `,
-        coinParams,
-      );
-
-      items.push(
-        ...coinRows.map((row) => ({
           ...row,
           user_id: Number(row.user_id),
           session_id: null,

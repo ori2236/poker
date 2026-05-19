@@ -42,6 +42,7 @@ router.post(
   adminMiddleware,
   rejectBonusRequest,
 );
+
 router.post(
   "/coin/:id/approve",
   authMiddleware,
