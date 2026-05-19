@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const { attachSpecialCoins } = require("../utils/coinHelpers");
+const { awardSessionResultAchievements } = require("../utils/achievementCoins");
 
 function calculateAmountFromBreakdown({
   white_count = 0,
@@ -740,6 +741,25 @@ async function endActiveSession(req, res) {
       `,
       [adminUserId, sessionId],
     );
+
+    const [sessionUserRows] = await connection.execute(
+      `
+      SELECT DISTINCT user_id
+      FROM conversion_requests
+      WHERE session_id = ?
+        AND status = 'APPROVED'
+        AND type = 'TO_CHIPS'
+      `,
+      [sessionId],
+    );
+
+    for (const sessionUser of sessionUserRows) {
+      await awardSessionResultAchievements(connection, {
+        userId: sessionUser.user_id,
+        sessionId,
+        awardedByUserId: adminUserId,
+      });
+    }
 
     const winnerCoinHolders = await refreshWinnerCoinHolders(connection);
     await connection.commit();

@@ -1,6 +1,7 @@
 const db = require("../config/db");
 const bcrypt = require("bcrypt");
 const { attachSpecialCoins, validateSelectedCoins } = require("../utils/coinHelpers");
+const { isCardHandCoinEligible } = require("../utils/achievementCoins");
 
 const CARD_HANDS = [
   "HIGH_CARD",
@@ -233,6 +234,10 @@ async function updateUserCardHand(req, res) {
       return res.status(400).json({ message: "Invalid card hand" });
     }
 
+    if (!isCardHandCoinEligible(cardHand)) {
+      return res.status(400).json({ message: "Card coin is available only from Full House and above" });
+    }
+
     const [rows] = await db.execute(
       "SELECT id FROM users WHERE id = ? AND is_active = 1 LIMIT 1",
       [targetUserId],
@@ -382,6 +387,11 @@ async function deleteUser(req, res) {
         current_price = CASE WHEN current_price IS NULL OR current_price < 100 THEN 100 ELSE current_price END
       WHERE sale_seller_user_id = ?
       `,
+      [targetUserId],
+    );
+
+    await connection.execute(
+      "DELETE FROM user_achievement_coins WHERE user_id = ?",
       [targetUserId],
     );
 

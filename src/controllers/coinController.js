@@ -2,6 +2,7 @@ const db = require("../config/db");
 const {
   clearSelectedSpecialCoin,
 } = require("../utils/coinHelpers");
+const { awardMarketPurchaseAchievements } = require("../utils/achievementCoins");
 
 function toNumber(value) {
   return Number(value || 0);
@@ -307,6 +308,14 @@ async function buyCoin(req, res) {
     }
 
     await clearSelectedSpecialCoin(connection, usersToClear, coinId);
+
+    await awardMarketPurchaseAchievements(connection, {
+      buyerUserId: userId,
+      coinId,
+      price,
+      previousOwnerUserId: coin.status === "PAID_OWNED" ? coin.owner_user_id : null,
+      previousSellerUserId: coin.status === "FOR_SALE" ? coin.sale_seller_user_id : null,
+    });
 
     await connection.execute(
       `

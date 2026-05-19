@@ -1,3 +1,10 @@
+const {
+  attachAchievementCoins,
+  getAchievementCoinsForUserIds,
+  isCardHandCoinEligible,
+  normalizeAchievementCode,
+} = require("./achievementCoins");
+
 const BASIC_SELECTED_COINS = new Set(["APP", "CARD", "PLACE"]);
 
 function normalizeSelectedCoinValue(value) {
@@ -19,6 +26,14 @@ function normalizeSelectedCoinValue(value) {
     }
   }
 
+  const achievementMatch = normalized.match(/^ACHIEVEMENT_([A-Z0-9_]+)$/);
+  if (achievementMatch) {
+    const coinCode = normalizeAchievementCode(achievementMatch[1]);
+    if (coinCode) {
+      return `ACHIEVEMENT_${coinCode}`;
+    }
+  }
+
   return undefined;
 }
 
@@ -27,6 +42,13 @@ function getSpecialCoinId(selectionValue) {
   if (!normalized || normalized === undefined) return null;
   const match = normalized.match(/^SPECIAL_(\d+)$/);
   return match ? Number(match[1]) : null;
+}
+
+function getAchievementCoinCode(selectionValue) {
+  const normalized = normalizeSelectedCoinValue(selectionValue);
+  if (!normalized || normalized === undefined) return null;
+  const match = normalized.match(/^ACHIEVEMENT_([A-Z0-9_]+)$/);
+  return match ? normalizeAchievementCode(match[1]) : null;
 }
 
 async function validateSelectedCoins(connection, userId, firstCoin, secondCoin) {
@@ -39,6 +61,17 @@ async function validateSelectedCoins(connection, userId, firstCoin, secondCoin) 
 
   if (normalizedFirst && normalizedSecond && normalizedFirst === normalizedSecond) {
     throw new Error("Cannot select the same coin twice");
+  }
+
+  if (normalizedFirst === "CARD" || normalizedSecond === "CARD") {
+    const [userRows] = await connection.execute(
+      "SELECT card_hand FROM users WHERE id = ? LIMIT 1",
+      [userId],
+    );
+
+    if (!isCardHandCoinEligible(userRows[0]?.card_hand)) {
+      throw new Error("Card coin is available only from Full House and above");
+    }
   }
 
   const specialIds = [getSpecialCoinId(normalizedFirst), getSpecialCoinId(normalizedSecond)].filter(Boolean);
@@ -59,6 +92,17 @@ async function validateSelectedCoins(connection, userId, firstCoin, secondCoin) 
 
     if (rows.length !== specialIds.length) {
       throw new Error("You can only select coins that belong to you");
+    }
+  }
+
+  const achievementCodes = [getAchievementCoinCode(normalizedFirst), getAchievementCoinCode(normalizedSecond)].filter(Boolean);
+
+  if (achievementCodes.length > 0) {
+    const achievementsByUserId = await getAchievementCoinsForUserIds(connection, [userId]);
+    const ownedCodes = new Set((achievementsByUserId.get(Number(userId)) || []).map((coin) => coin.code));
+
+    if (achievementCodes.some((code) => !ownedCodes.has(code))) {
+      throw new Error("You can only select achievement coins that belong to you");
     }
   }
 
@@ -130,10 +174,12 @@ async function attachSpecialCoins(connection, rows, idField = "id") {
   const userIds = rows.map((row) => Number(row[idField])).filter((id) => Number.isInteger(id) && id > 0);
   const coinsByUserId = await getSpecialCoinsForUserIds(connection, userIds);
 
-  return rows.map((row) => ({
+  const rowsWithSpecialCoins = rows.map((row) => ({
     ...row,
     special_coins: coinsByUserId.get(Number(row[idField])) || [],
   }));
+
+  return attachAchievementCoins(connection, rowsWithSpecialCoins, idField);
 }
 
 async function clearSelectedSpecialCoin(connection, userIds, coinId) {
@@ -163,6 +209,7 @@ module.exports = {
   normalizeSelectedCoinValue,
   validateSelectedCoins,
   getSpecialCoinId,
+  getAchievementCoinCode,
   getSpecialCoinsForUserIds,
   attachSpecialCoins,
   clearSelectedSpecialCoin,

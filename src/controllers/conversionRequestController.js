@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const { awardSessionResultAchievements } = require("../utils/achievementCoins");
 
 function calculateAmountFromBreakdown({
   white_count = 0,
@@ -750,6 +751,14 @@ async function approveConversionRequest(req, res) {
       `,
       [adminUserId, requestId],
     );
+
+    if (request.type === "TO_COINS" && request.session_id) {
+      await awardSessionResultAchievements(connection, {
+        userId: request.user_id,
+        sessionId: request.session_id,
+        awardedByUserId: adminUserId,
+      });
+    }
 
     await connection.commit();
 

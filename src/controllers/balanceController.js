@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const { attachSpecialCoins } = require("../utils/coinHelpers");
+const { awardPodiumAchievements } = require("../utils/achievementCoins");
 
 async function getMyBalance(req, res) {
   try {
@@ -108,6 +109,8 @@ async function getLeaderboard(req, res) {
 
       is_winner_coin_holder: Boolean(row.is_winner_coin_holder),
     }));
+
+    await awardPodiumAchievements(db, normalizedRows);
 
     const rowsWithCoins = await attachSpecialCoins(db, normalizedRows, "id");
 
