@@ -72,6 +72,7 @@ async function insertTransaction(connection, data) {
 function mapCoinRow(row, userId, balance, pendingRequestCoinIds) {
   const currentPrice = Number(row.current_price || 100);
   const ownedByMe = Number(row.owner_user_id || 0) === Number(userId);
+  const listedByMe = Number(row.sale_seller_user_id || 0) === Number(userId);
   const isMarketOpen = row.status !== "EXCLUSIVE_LOCKED";
   const canBuy = isMarketOpen && !ownedByMe;
   const canListForSale = row.status === "PAID_OWNED" && ownedByMe;
@@ -99,6 +100,7 @@ function mapCoinRow(row, userId, balance, pendingRequestCoinIds) {
     locked_forever: Boolean(row.locked_forever),
     has_pending_request: hasPendingRequest,
     owned_by_me: ownedByMe,
+    listed_by_me: listedByMe,
     can_buy: canBuy,
     can_list_for_sale: canListForSale,
     can_request_exclusive: canRequestExclusive,
@@ -235,6 +237,12 @@ async function buyCoin(req, res) {
     }
 
     const price = Number(coin.current_price || 100);
+    const isSellerBuyingBack =
+      coin.status === "FOR_SALE" &&
+      Number(coin.sale_seller_user_id || 0) === Number(userId);
+    const buyerPurchasePrice = isSellerBuyingBack
+      ? Number(coin.sale_original_price || price)
+      : price;
     const balance = await getUserBalance(connection, userId);
 
     if (balance < price) {
@@ -246,12 +254,14 @@ async function buyCoin(req, res) {
       user_id: userId,
       created_by_user_id: userId,
       session_id: null,
-      type: "COIN_PURCHASE",
+      type: isSellerBuyingBack ? "COIN_BUYBACK" : "COIN_PURCHASE",
       direction: "DEBIT",
       amount: price,
       from_unit: "DOUBLE_O",
       to_unit: "COIN",
-      note: `Bought treasure coin: ${coin.title}`,
+      note: isSellerBuyingBack
+        ? `Bought back listed treasure coin: ${coin.title}`
+        : `Bought treasure coin: ${coin.title}`,
     });
 
     const usersToClear = [];
@@ -279,7 +289,7 @@ async function buyCoin(req, res) {
     if (coin.status === "FOR_SALE" && coin.sale_seller_user_id) {
       const finalRefund = Math.max(0, Number(coin.sale_original_price || 0) - Number(coin.sale_paid_upfront || 0));
 
-      if (finalRefund > 0) {
+      if (!isSellerBuyingBack && finalRefund > 0) {
         await insertTransaction(connection, {
           user_id: coin.sale_seller_user_id,
           created_by_user_id: userId,
@@ -312,13 +322,13 @@ async function buyCoin(req, res) {
         locked_forever = 0
       WHERE coin_id = ?
       `,
-      [userId, price + 50, price, coinId],
+      [userId, price + 50, buyerPurchasePrice, coinId],
     );
 
     await connection.commit();
 
     res.json({
-      message: "Coin bought successfully",
+      message: isSellerBuyingBack ? "Coin bought back successfully" : "Coin bought successfully",
       coinId,
       paid: price,
       nextPrice: price + 50,
