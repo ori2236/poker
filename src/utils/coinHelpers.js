@@ -1,11 +1,10 @@
 const {
   attachAchievementCoins,
   getAchievementCoinsForUserIds,
-  isCardHandCoinEligible,
   normalizeAchievementCode,
 } = require("./achievementCoins");
 
-const BASIC_SELECTED_COINS = new Set(["APP", "CARD", "PLACE"]);
+const BASIC_SELECTED_COINS = new Set(["APP", "PLACE"]);
 
 function normalizeSelectedCoinValue(value) {
   if (value === null || value === undefined || value === "") {
@@ -61,17 +60,6 @@ async function validateSelectedCoins(connection, userId, firstCoin, secondCoin) 
 
   if (normalizedFirst && normalizedSecond && normalizedFirst === normalizedSecond) {
     throw new Error("Cannot select the same coin twice");
-  }
-
-  if (normalizedFirst === "CARD" || normalizedSecond === "CARD") {
-    const [userRows] = await connection.execute(
-      "SELECT card_hand FROM users WHERE id = ? LIMIT 1",
-      [userId],
-    );
-
-    if (!isCardHandCoinEligible(userRows[0]?.card_hand)) {
-      throw new Error("Card coin is available only from Full House and above");
-    }
   }
 
   const specialIds = [getSpecialCoinId(normalizedFirst), getSpecialCoinId(normalizedSecond)].filter(Boolean);

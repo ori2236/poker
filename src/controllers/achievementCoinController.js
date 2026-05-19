@@ -2,9 +2,12 @@ const db = require("../config/db");
 const {
   getAchievementCoinCatalog,
   isAdminAchievementCode,
+  isCardHandAchievementCode,
   normalizeAchievementCode,
   awardAchievementCoin,
   revokeAchievementCoin,
+  clearSelectedAchievementCoin,
+  recalculateBestHandEver,
 } = require("../utils/achievementCoins");
 
 async function getAchievementCoinsCatalog(req, res) {
@@ -52,6 +55,10 @@ async function grantAchievementCoinToUser(req, res) {
       },
     });
 
+    if (isCardHandAchievementCode(coinCode)) {
+      await recalculateBestHandEver(connection);
+    }
+
     await connection.commit();
 
     res.json({
@@ -87,17 +94,11 @@ async function removeAchievementCoinFromUser(req, res) {
     await connection.beginTransaction();
     const result = await revokeAchievementCoin(connection, targetUserId, coinCode);
 
-    const selectionKey = `ACHIEVEMENT_${coinCode}`;
-    await connection.execute(
-      `
-      UPDATE users
-      SET
-        selected_coin_1 = CASE WHEN selected_coin_1 = ? THEN NULL ELSE selected_coin_1 END,
-        selected_coin_2 = CASE WHEN selected_coin_2 = ? THEN NULL ELSE selected_coin_2 END
-      WHERE id = ?
-      `,
-      [selectionKey, selectionKey, targetUserId],
-    );
+    await clearSelectedAchievementCoin(connection, coinCode, [targetUserId]);
+
+    if (isCardHandAchievementCode(coinCode)) {
+      await recalculateBestHandEver(connection);
+    }
 
     await connection.commit();
 

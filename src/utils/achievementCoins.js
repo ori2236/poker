@@ -66,10 +66,42 @@ const ACHIEVEMENT_COIN_CATALOG = [
   {
     code: "BEST_HAND_EVER",
     title: "Best Hand Ever Coin",
-    description: "Admin-awarded coin for the strongest hand ever recorded in the app. If several players share the record, award it to each of them.",
-    award_mode: "ADMIN",
+    description: "Automatically belongs to whoever holds the strongest recorded card-hand coin in the app. If several players share the top hand, all of them get it.",
+    award_mode: "AUTO",
     image_name: "best-hand-ever-coin.png",
+    sort_order: 100,
+  },
+  {
+    code: "CARD_FULL_HOUSE",
+    title: "Full House Coin",
+    description: "Admin-awarded card coin for a recorded Full House hand.",
+    award_mode: "ADMIN",
+    image_name: "full-house-coin.png",
     sort_order: 110,
+  },
+  {
+    code: "CARD_FOUR_OF_A_KIND",
+    title: "Four of a Kind Coin",
+    description: "Admin-awarded card coin for a recorded Four of a Kind hand.",
+    award_mode: "ADMIN",
+    image_name: "four-of-a-kind-coin.png",
+    sort_order: 120,
+  },
+  {
+    code: "CARD_STRAIGHT_FLUSH",
+    title: "Straight Flush Coin",
+    description: "Admin-awarded card coin for a recorded Straight Flush hand.",
+    award_mode: "ADMIN",
+    image_name: "straight-flush-coin.png",
+    sort_order: 130,
+  },
+  {
+    code: "CARD_ROYAL_FLUSH",
+    title: "Royal Flush Coin",
+    description: "Admin-awarded card coin for a recorded Royal Flush hand.",
+    award_mode: "ADMIN",
+    image_name: "royal-flush-coin.png",
+    sort_order: 140,
   },
   {
     code: "HIGHEST_HAND",
@@ -77,7 +109,7 @@ const ACHIEVEMENT_COIN_CATALOG = [
     description: "Admin-awarded coin for a player who won or revealed the strongest hand in a relevant session/night.",
     award_mode: "ADMIN",
     image_name: "highest-hand-coin.png",
-    sort_order: 120,
+    sort_order: 150,
   },
   {
     code: "AA_WIN",
@@ -85,7 +117,7 @@ const ACHIEVEMENT_COIN_CATALOG = [
     description: "Admin-awarded coin for winning a hand with pocket aces.",
     award_mode: "ADMIN",
     image_name: "aa-coin.png",
-    sort_order: 130,
+    sort_order: 160,
   },
   {
     code: "SEVEN_TWO_WIN",
@@ -93,7 +125,7 @@ const ACHIEVEMENT_COIN_CATALOG = [
     description: "Admin-awarded coin for winning a hand with 7-2.",
     award_mode: "ADMIN",
     image_name: "seven-two-coin.png",
-    sort_order: 140,
+    sort_order: 170,
   },
 ];
 
@@ -120,6 +152,20 @@ const CARD_HAND_RANKS = {
   ROYAL_FLUSH: 10,
 };
 
+const CARD_HAND_TO_COIN_CODE = {
+  FULL_HOUSE: "CARD_FULL_HOUSE",
+  FOUR_OF_A_KIND: "CARD_FOUR_OF_A_KIND",
+  STRAIGHT_FLUSH: "CARD_STRAIGHT_FLUSH",
+  ROYAL_FLUSH: "CARD_ROYAL_FLUSH",
+};
+
+const CARD_HAND_COIN_RANKS = {
+  CARD_FULL_HOUSE: CARD_HAND_RANKS.FULL_HOUSE,
+  CARD_FOUR_OF_A_KIND: CARD_HAND_RANKS.FOUR_OF_A_KIND,
+  CARD_STRAIGHT_FLUSH: CARD_HAND_RANKS.STRAIGHT_FLUSH,
+  CARD_ROYAL_FLUSH: CARD_HAND_RANKS.ROYAL_FLUSH,
+};
+
 function normalizeAchievementCode(value) {
   const normalized = String(value || "").trim().toUpperCase();
   return ACHIEVEMENT_COIN_BY_CODE.has(normalized) ? normalized : null;
@@ -129,13 +175,29 @@ function isAdminAchievementCode(code) {
   return ADMIN_ACHIEVEMENT_CODES.has(normalizeAchievementCode(code));
 }
 
+function isCardHandAchievementCode(code) {
+  const normalized = normalizeAchievementCode(code);
+  return !!normalized && Object.prototype.hasOwnProperty.call(CARD_HAND_COIN_RANKS, normalized);
+}
+
 function getAchievementCoinCatalog() {
   return ACHIEVEMENT_COIN_CATALOG.map((coin) => ({ ...coin }));
 }
 
+function normalizeCardHand(value) {
+  const normalized = String(value || "").trim().toUpperCase();
+  return Object.prototype.hasOwnProperty.call(CARD_HAND_RANKS, normalized) ? normalized : null;
+}
+
 function isCardHandCoinEligible(cardHand) {
-  const normalized = String(cardHand || "").trim().toUpperCase();
-  return Number(CARD_HAND_RANKS[normalized] || 0) >= CARD_HAND_RANKS.FULL_HOUSE;
+  const normalized = normalizeCardHand(cardHand);
+  return !!normalized && Number(CARD_HAND_RANKS[normalized] || 0) >= CARD_HAND_RANKS.FULL_HOUSE;
+}
+
+function getCardHandAchievementCode(cardHand) {
+  const normalized = normalizeCardHand(cardHand);
+  if (!isCardHandCoinEligible(normalized)) return null;
+  return CARD_HAND_TO_COIN_CODE[normalized] || null;
 }
 
 async function ensureAchievementCoinTables(connection) {
@@ -169,7 +231,6 @@ async function awardAchievementCoin(connection, {
   if (!normalizedCode || !Number.isInteger(normalizedUserId) || normalizedUserId <= 0) {
     return { awarded: false, reason: "INVALID_INPUT" };
   }
-
 
   const [userRows] = await connection.execute(
     "SELECT id FROM users WHERE id = ? AND is_active = 1 LIMIT 1",
@@ -211,13 +272,47 @@ async function revokeAchievementCoin(connection, userId, coinCode) {
     return { removed: false, reason: "INVALID_INPUT" };
   }
 
-
   const [result] = await connection.execute(
     "DELETE FROM user_achievement_coins WHERE user_id = ? AND coin_code = ?",
     [normalizedUserId, normalizedCode],
   );
 
   return { removed: Number(result.affectedRows || 0) > 0 };
+}
+
+async function clearSelectedAchievementCoin(connection, coinCode, userIds = null) {
+  const normalizedCode = normalizeAchievementCode(coinCode);
+  if (!normalizedCode) return;
+
+  const selectionKey = `ACHIEVEMENT_${normalizedCode}`;
+  const ids = Array.isArray(userIds)
+    ? [...new Set(userIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))]
+    : [];
+
+  if (ids.length > 0) {
+    const placeholders = ids.map(() => "?").join(", ");
+    await connection.execute(
+      `
+      UPDATE users
+      SET
+        selected_coin_1 = CASE WHEN selected_coin_1 = ? THEN NULL ELSE selected_coin_1 END,
+        selected_coin_2 = CASE WHEN selected_coin_2 = ? THEN NULL ELSE selected_coin_2 END
+      WHERE id IN (${placeholders})
+      `,
+      [selectionKey, selectionKey, ...ids],
+    );
+    return;
+  }
+
+  await connection.execute(
+    `
+    UPDATE users
+    SET
+      selected_coin_1 = CASE WHEN selected_coin_1 = ? THEN NULL ELSE selected_coin_1 END,
+      selected_coin_2 = CASE WHEN selected_coin_2 = ? THEN NULL ELSE selected_coin_2 END
+    `,
+    [selectionKey, selectionKey],
+  );
 }
 
 async function getAchievementCoinsForUserIds(connection, userIds) {
@@ -231,7 +326,6 @@ async function getAchievementCoinsForUserIds(connection, userIds) {
   if (ids.length === 0) {
     return map;
   }
-
 
   const placeholders = ids.map(() => "?").join(", ");
   const [rows] = await connection.execute(
@@ -465,18 +559,125 @@ async function awardPodiumAchievements(connection, leaderboardRows) {
   return awards;
 }
 
+async function recalculateBestHandEver(connection) {
+  const cardCodes = Object.keys(CARD_HAND_COIN_RANKS);
+  const placeholders = cardCodes.map(() => "?").join(", ");
+
+  const [rows] = await connection.execute(
+    `
+    SELECT uac.user_id, uac.coin_code
+    FROM user_achievement_coins uac
+    JOIN users u ON u.id = uac.user_id AND u.is_active = 1
+    WHERE uac.coin_code IN (${placeholders})
+    `,
+    cardCodes,
+  );
+
+  if (rows.length === 0) {
+    await connection.execute("DELETE FROM user_achievement_coins WHERE coin_code = 'BEST_HAND_EVER'");
+    await clearSelectedAchievementCoin(connection, "BEST_HAND_EVER");
+    return { bestRank: null, userIds: [] };
+  }
+
+  const bestRankByUser = new Map();
+
+  rows.forEach((row) => {
+    const rank = Number(CARD_HAND_COIN_RANKS[row.coin_code] || 0);
+    const userId = Number(row.user_id);
+    const previous = Number(bestRankByUser.get(userId) || 0);
+    if (rank > previous) bestRankByUser.set(userId, rank);
+  });
+
+  const bestRank = Math.max(...bestRankByUser.values());
+  const bestUserIds = [...bestRankByUser.entries()]
+    .filter(([, rank]) => rank === bestRank)
+    .map(([userId]) => userId);
+
+  const [oldRows] = await connection.execute(
+    "SELECT user_id FROM user_achievement_coins WHERE coin_code = 'BEST_HAND_EVER'",
+  );
+  const oldUserIds = oldRows.map((row) => Number(row.user_id));
+  const bestUserIdSet = new Set(bestUserIds);
+  const usersToClear = oldUserIds.filter((userId) => !bestUserIdSet.has(userId));
+
+  if (bestUserIds.length > 0) {
+    const valuesSql = bestUserIds.map(() => "(?, 'BEST_HAND_EVER', NULL, NULL, ?)").join(", ");
+    const values = bestUserIds.flatMap((userId) => [
+      userId,
+      JSON.stringify({ source: "AUTO_BEST_HAND_EVER", bestRank }),
+    ]);
+
+    await connection.execute(
+      `
+      INSERT IGNORE INTO user_achievement_coins
+        (user_id, coin_code, awarded_by_user_id, source_session_id, metadata_json)
+      VALUES ${valuesSql}
+      `,
+      values,
+    );
+  }
+
+  if (usersToClear.length > 0) {
+    const clearPlaceholders = usersToClear.map(() => "?").join(", ");
+    await connection.execute(
+      `
+      DELETE FROM user_achievement_coins
+      WHERE coin_code = 'BEST_HAND_EVER'
+        AND user_id IN (${clearPlaceholders})
+      `,
+      usersToClear,
+    );
+    await clearSelectedAchievementCoin(connection, "BEST_HAND_EVER", usersToClear);
+  }
+
+  return { bestRank, userIds: bestUserIds };
+}
+
+async function awardCardHandAchievementCoin(connection, {
+  userId,
+  cardHand,
+  awardedByUserId = null,
+}) {
+  const coinCode = getCardHandAchievementCode(cardHand);
+
+  if (!coinCode) {
+    return { awarded: false, reason: "CARD_HAND_NOT_ELIGIBLE" };
+  }
+
+  const result = await awardAchievementCoin(connection, {
+    userId,
+    coinCode,
+    awardedByUserId,
+    metadata: {
+      source: "ADMIN_CARD_HAND",
+      cardHand: normalizeCardHand(cardHand),
+    },
+  });
+
+  await recalculateBestHandEver(connection);
+
+  return result;
+}
+
 module.exports = {
   ACHIEVEMENT_COIN_CATALOG,
+  CARD_HAND_COIN_RANKS,
   normalizeAchievementCode,
   isAdminAchievementCode,
+  isCardHandAchievementCode,
   getAchievementCoinCatalog,
+  normalizeCardHand,
   isCardHandCoinEligible,
+  getCardHandAchievementCode,
   ensureAchievementCoinTables,
   awardAchievementCoin,
   revokeAchievementCoin,
+  clearSelectedAchievementCoin,
   getAchievementCoinsForUserIds,
   attachAchievementCoins,
   awardMarketPurchaseAchievements,
   awardSessionResultAchievements,
   awardPodiumAchievements,
+  awardCardHandAchievementCoin,
+  recalculateBestHandEver,
 };

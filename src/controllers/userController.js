@@ -1,7 +1,11 @@
 const db = require("../config/db");
 const bcrypt = require("bcrypt");
 const { attachSpecialCoins, validateSelectedCoins } = require("../utils/coinHelpers");
-const { isCardHandCoinEligible } = require("../utils/achievementCoins");
+const {
+  awardCardHandAchievementCoin,
+  isCardHandCoinEligible,
+  recalculateBestHandEver,
+} = require("../utils/achievementCoins");
 
 const CARD_HANDS = [
   "HIGH_CARD",
@@ -222,7 +226,10 @@ async function updateMySelectedCoins(req, res) {
 }
 
 async function updateUserCardHand(req, res) {
+  const connection = await db.getConnection();
+
   try {
+    const adminUserId = req.user.id;
     const targetUserId = Number(req.params.id);
     const cardHand = normalizeCardHand(req.body.cardHand);
 
@@ -238,30 +245,47 @@ async function updateUserCardHand(req, res) {
       return res.status(400).json({ message: "Card coin is available only from Full House and above" });
     }
 
-    const [rows] = await db.execute(
-      "SELECT id FROM users WHERE id = ? AND is_active = 1 LIMIT 1",
+    await connection.beginTransaction();
+
+    const [rows] = await connection.execute(
+      "SELECT id, card_hand FROM users WHERE id = ? AND is_active = 1 LIMIT 1 FOR UPDATE",
       [targetUserId],
     );
 
     if (rows.length === 0) {
+      await connection.rollback();
       return res.status(404).json({ message: "User not found" });
     }
 
-    await db.execute("UPDATE users SET card_hand = ? WHERE id = ?", [
+    const result = await awardCardHandAchievementCoin(connection, {
+      userId: targetUserId,
+      cardHand,
+      awardedByUserId: adminUserId,
+    });
+
+    await connection.execute("UPDATE users SET card_hand = ? WHERE id = ?", [
       cardHand,
       targetUserId,
     ]);
 
+    await connection.commit();
+
     res.json({
-      message: "Card coin updated successfully",
+      message: result.awarded ? "Card coin awarded successfully" : "User already has this card coin",
+      awarded: result.awarded,
       userId: targetUserId,
       cardHand,
+      coin: result.coin || null,
     });
   } catch (error) {
+    await connection.rollback();
     console.error("updateUserCardHand error:", error);
     res.status(500).json({ message: "Server error" });
+  } finally {
+    connection.release();
   }
 }
+
 
 
 
@@ -394,6 +418,8 @@ async function deleteUser(req, res) {
       "DELETE FROM user_achievement_coins WHERE user_id = ?",
       [targetUserId],
     );
+
+    await recalculateBestHandEver(connection);
 
     await connection.execute(
       `
