@@ -104,14 +104,6 @@ const ACHIEVEMENT_COIN_CATALOG = [
     sort_order: 140,
   },
   {
-    code: "HIGHEST_HAND",
-    title: "Highest Hand Coin",
-    description: "Admin-awarded coin for a player who won or revealed the strongest hand in a relevant session/night.",
-    award_mode: "ADMIN",
-    image_name: "highest-hand-coin.png",
-    sort_order: 150,
-  },
-  {
     code: "AA_WIN",
     title: "Pocket Aces Coin",
     description: "Admin-awarded coin for winning a hand with pocket aces.",
@@ -120,12 +112,12 @@ const ACHIEVEMENT_COIN_CATALOG = [
     sort_order: 160,
   },
   {
-    code: "SEVEN_TWO_WIN",
-    title: "Seven-Deuce Coin",
-    description: "Admin-awarded coin for winning a hand with 7-2.",
+    code: "SEVEN_DEUCE",
+    title: "Seven Deuce Coin",
+    description: "Admin-awarded coin for winning a hand with Seven-Deuce.",
     award_mode: "ADMIN",
-    image_name: "seven-two-coin.png",
-    sort_order: 170,
+    image_name: "seven-deuce-coin.png",
+    sort_order: 160,
   },
 ];
 
