@@ -1,5 +1,6 @@
 const db = require("../config/db");
 const {
+  attachSpecialCoins,
   clearSelectedSpecialCoin,
 } = require("../utils/coinHelpers");
 const { awardMarketPurchaseAchievements } = require("../utils/achievementCoins");
@@ -37,6 +38,69 @@ async function getUserBalance(connection, userId) {
   );
 
   return Number(rows[0]?.balance || 0);
+}
+
+async function getUserRank(connection, userId) {
+  const [rows] = await connection.execute(`
+    SELECT
+      u.id,
+      COALESCE(SUM(
+        CASE
+          WHEN bt.direction = 'CREDIT' THEN bt.amount
+          WHEN bt.direction = 'DEBIT' THEN -bt.amount
+          ELSE 0
+        END
+      ), 0) AS balance,
+      COALESCE(MAX(bt.created_at), u.created_at) AS balance_held_since,
+      u.created_at,
+      u.username
+    FROM users u
+    LEFT JOIN balance_transactions bt ON bt.user_id = u.id
+    WHERE u.is_active = 1
+    GROUP BY u.id, u.created_at, u.username
+    ORDER BY balance DESC, balance_held_since ASC, u.created_at ASC, u.username ASC
+  `);
+
+  const index = rows.findIndex((row) => Number(row.id) === Number(userId));
+  return index >= 0 ? index + 1 : null;
+}
+
+async function getFramePlayer(connection, userId) {
+  const [rows] = await connection.execute(
+    `
+    SELECT
+      id,
+      username,
+      card_hand,
+      selected_coin_1,
+      selected_coin_2,
+      is_winner_coin_holder
+    FROM users
+    WHERE id = ? AND is_active = 1
+    LIMIT 1
+    `,
+    [userId],
+  );
+
+  if (rows.length === 0) {
+    return null;
+  }
+
+  const rank = await getUserRank(connection, userId);
+  const normalizedRows = [
+    {
+      ...rows[0],
+      id: Number(rows[0].id),
+      rank,
+      card_hand: rows[0].card_hand || "HIGH_CARD",
+      selected_coin_1: rows[0].selected_coin_1 || null,
+      selected_coin_2: rows[0].selected_coin_2 || null,
+      is_winner_coin_holder: Boolean(rows[0].is_winner_coin_holder),
+    },
+  ];
+
+  const rowsWithCoins = await attachSpecialCoins(connection, normalizedRows, "id");
+  return rowsWithCoins[0] || null;
 }
 
 async function insertTransaction(connection, data) {
@@ -139,6 +203,8 @@ async function getCoins(req, res) {
       [userId],
     );
 
+    const framePlayer = await getFramePlayer(connection, userId);
+
     const [coins] = await connection.execute(
       `
       SELECT
@@ -175,6 +241,7 @@ async function getCoins(req, res) {
       balance,
       selected_coin_1: selected.selected_coin_1 || null,
       selected_coin_2: selected.selected_coin_2 || null,
+      frame_player: framePlayer,
       coins: coins.map((row) => mapCoinRow(row, userId, balance, pendingRequestCoinIds)),
     });
   } catch (error) {
