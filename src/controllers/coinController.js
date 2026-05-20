@@ -71,6 +71,8 @@ async function getFramePlayer(connection, userId) {
     SELECT
       id,
       username,
+      profile_image_base64,
+      secondary_profile_image_base64,
       card_hand,
       selected_coin_1,
       selected_coin_2,
