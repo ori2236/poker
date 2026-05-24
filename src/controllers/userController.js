@@ -3,9 +3,12 @@ const bcrypt = require("bcrypt");
 const { attachSpecialCoins, validateSelectedCoins } = require("../utils/coinHelpers");
 const {
   awardCardHandAchievementCoin,
+  ensureAdminProgrammerCoins,
   isCardHandCoinEligible,
   recalculateBestHandEver,
+  recalculateUltimateTycoon,
 } = require("../utils/achievementCoins");
+const { refreshWinnerCoinHolders } = require("../utils/winnerCoin");
 
 const CARD_HANDS = [
   "HIGH_CARD",
@@ -45,6 +48,8 @@ function normalizeSelectedCoin(value) {
 
 async function getAllUsers(req, res) {
   try {
+    await refreshWinnerCoinHolders(db);
+
     const [rows] = await db.execute(`
       SELECT
         id,
@@ -73,6 +78,9 @@ async function getAllUsers(req, res) {
       selected_coin_1: row.selected_coin_1,
       selected_coin_2: row.selected_coin_2,
     }));
+
+    await ensureAdminProgrammerCoins(db);
+    await recalculateUltimateTycoon(db);
 
     const rowsWithCoins = await attachSpecialCoins(db, normalizedRows, "id");
 

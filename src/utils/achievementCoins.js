@@ -16,6 +16,14 @@ const ACHIEVEMENT_COIN_CATALOG = [
     sort_order: 20,
   },
   {
+    code: "QUINTUPLE_UP",
+    title: "Quintuple Up Coin",
+    description: "Awarded once a player cashes out at least 5x their total buy-in for a session.",
+    award_mode: "AUTO",
+    image_name: "quintaple-up-coin.png",
+    sort_order: 25,
+  },
+  {
     code: "MARKET_SHARK",
     title: "Market Shark Coin",
     description: "Awarded once a player buys a treasure coin that previously belonged to another player.",
@@ -62,6 +70,22 @@ const ACHIEVEMENT_COIN_CATALOG = [
     award_mode: "AUTO",
     image_name: "podium-coin.png",
     sort_order: 80,
+  },
+  {
+    code: "ULTIMATE_TYCOON",
+    title: "Ultimate Tycoon Coin",
+    description: "Automatically belongs to the player who is currently ranked first on the leaderboard.",
+    award_mode: "AUTO",
+    image_name: "ultimate-tycoon.png",
+    sort_order: 90,
+  },
+  {
+    code: "PROGRAMMER",
+    title: "Programmer Coin",
+    description: "Automatically belongs to the app programmer/admin.",
+    award_mode: "AUTO",
+    image_name: "programmer-coin.png",
+    sort_order: 95,
   },
   {
     code: "BEST_HAND_EVER",
@@ -118,6 +142,22 @@ const ACHIEVEMENT_COIN_CATALOG = [
     award_mode: "ADMIN",
     image_name: "seven-deuce-coin.png",
     sort_order: 160,
+  },
+  {
+    code: "HOST_MASTER",
+    title: "Host Master Coin",
+    description: "Admin-awarded coin for the player who hosts the poker night.",
+    award_mode: "ADMIN",
+    image_name: "host-master.png",
+    sort_order: 170,
+  },
+  {
+    code: "CO_FOUNDER",
+    title: "Co-Founder Coin",
+    description: "Admin-awarded coin for the app co-founders.",
+    award_mode: "ADMIN",
+    image_name: "co-founder-coin.png",
+    sort_order: 180,
   },
 ];
 
@@ -498,6 +538,16 @@ async function awardSessionResultAchievements(connection, {
         metadata: result,
       }));
     }
+
+    if (ratio >= 5) {
+      awards.push(await awardAchievementCoin(connection, {
+        userId,
+        coinCode: "QUINTUPLE_UP",
+        awardedByUserId,
+        sourceSessionId: sessionId,
+        metadata: result,
+      }));
+    }
   }
 
   const streak = await getCurrentProfitStreak(connection, userId);
@@ -533,6 +583,128 @@ async function awardSessionResultAchievements(connection, {
   }
 
   return awards;
+}
+
+async function ensureAdminProgrammerCoins(connection) {
+  await ensureAchievementCoinTables(connection);
+
+  const [adminRows] = await connection.execute(
+    "SELECT id FROM users WHERE role = 'ADMIN' AND is_active = 1 ORDER BY id ASC",
+  );
+
+  const adminIds = adminRows.map((row) => Number(row.id)).filter((id) => Number.isInteger(id) && id > 0);
+  const adminIdSet = new Set(adminIds);
+
+  const [oldRows] = await connection.execute(
+    "SELECT user_id FROM user_achievement_coins WHERE coin_code = 'PROGRAMMER'",
+  );
+  const oldUserIds = oldRows.map((row) => Number(row.user_id)).filter((id) => Number.isInteger(id) && id > 0);
+  const usersToClear = oldUserIds.filter((userId) => !adminIdSet.has(userId));
+
+  if (usersToClear.length > 0) {
+    const placeholders = usersToClear.map(() => "?").join(", ");
+    await connection.execute(
+      `
+      DELETE FROM user_achievement_coins
+      WHERE coin_code = 'PROGRAMMER'
+        AND user_id IN (${placeholders})
+      `,
+      usersToClear,
+    );
+    await clearSelectedAchievementCoin(connection, "PROGRAMMER", usersToClear);
+  }
+
+  for (const userId of adminIds) {
+    await awardAchievementCoin(connection, {
+      userId,
+      coinCode: "PROGRAMMER",
+      awardedByUserId: null,
+      metadata: { source: "AUTO_ADMIN_PROGRAMMER" },
+    });
+  }
+
+  return { userIds: adminIds };
+}
+
+async function recalculateUltimateTycoon(connection, leaderboardRows = null) {
+  await ensureAchievementCoinTables(connection);
+
+  let rows = Array.isArray(leaderboardRows) ? leaderboardRows : null;
+
+  if (!rows) {
+    const [dbRows] = await connection.execute(`
+      SELECT
+        u.id,
+        u.username,
+        COALESCE(SUM(
+          CASE
+            WHEN bt.direction = 'CREDIT' THEN bt.amount
+            WHEN bt.direction = 'DEBIT' THEN -bt.amount
+            ELSE 0
+          END
+        ), 0) AS balance,
+        COALESCE(MAX(bt.created_at), u.created_at) AS balance_held_since,
+        u.created_at
+      FROM users u
+      LEFT JOIN balance_transactions bt ON bt.user_id = u.id
+      WHERE u.is_active = 1
+      GROUP BY u.id, u.username, u.created_at
+      ORDER BY balance DESC, balance_held_since ASC, u.created_at ASC, u.username ASC
+    `);
+
+    rows = dbRows.map((row, index) => ({
+      ...row,
+      rank: index + 1,
+      id: Number(row.id),
+      balance: Number(row.balance || 0),
+    }));
+  }
+
+  const firstPlace = rows.find((row) => Number(row.rank || 0) === 1) || rows[0] || null;
+  const firstPlaceUserId = firstPlace ? Number(firstPlace.id || firstPlace.user_id || 0) : 0;
+
+  const [oldRows] = await connection.execute(
+    "SELECT user_id FROM user_achievement_coins WHERE coin_code = 'ULTIMATE_TYCOON'",
+  );
+  const oldUserIds = oldRows.map((row) => Number(row.user_id)).filter((id) => Number.isInteger(id) && id > 0);
+
+  if (!Number.isInteger(firstPlaceUserId) || firstPlaceUserId <= 0) {
+    await connection.execute("DELETE FROM user_achievement_coins WHERE coin_code = 'ULTIMATE_TYCOON'");
+    await clearSelectedAchievementCoin(connection, "ULTIMATE_TYCOON", oldUserIds);
+    return { userId: null };
+  }
+
+  const usersToClear = oldUserIds.filter((userId) => userId !== firstPlaceUserId);
+
+  if (usersToClear.length > 0) {
+    const placeholders = usersToClear.map(() => "?").join(", ");
+    await connection.execute(
+      `
+      DELETE FROM user_achievement_coins
+      WHERE coin_code = 'ULTIMATE_TYCOON'
+        AND user_id IN (${placeholders})
+      `,
+      usersToClear,
+    );
+    await clearSelectedAchievementCoin(connection, "ULTIMATE_TYCOON", usersToClear);
+  }
+
+  await awardAchievementCoin(connection, {
+    userId: firstPlaceUserId,
+    coinCode: "ULTIMATE_TYCOON",
+    awardedByUserId: null,
+    metadata: {
+      source: "AUTO_LEADERBOARD_FIRST_PLACE",
+      rank: 1,
+      balance: Number(firstPlace.balance || 0),
+    },
+  });
+
+  return {
+    userId: firstPlaceUserId,
+    username: firstPlace.username || null,
+    balance: Number(firstPlace.balance || 0),
+  };
 }
 
 async function awardPodiumAchievements(connection, leaderboardRows) {
@@ -669,7 +841,9 @@ module.exports = {
   attachAchievementCoins,
   awardMarketPurchaseAchievements,
   awardSessionResultAchievements,
+  ensureAdminProgrammerCoins,
   awardPodiumAchievements,
+  recalculateUltimateTycoon,
   awardCardHandAchievementCoin,
   recalculateBestHandEver,
 };

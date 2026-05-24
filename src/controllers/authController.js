@@ -1,6 +1,7 @@
 const db = require("../config/db");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
+const { ensureAdminProgrammerCoins } = require("../utils/achievementCoins");
 
 async function register(req, res) {
   try {
@@ -69,6 +70,10 @@ async function login(req, res) {
 
     if (!isValid) {
       return res.status(401).json({ message: "Invalid username or password" });
+    }
+
+    if (user.role === "ADMIN") {
+      await ensureAdminProgrammerCoins(db);
     }
 
     const token = crypto.randomBytes(32).toString("hex");
