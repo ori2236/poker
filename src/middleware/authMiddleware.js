@@ -10,7 +10,12 @@ async function authMiddleware(req, res, next) {
 
     const [rows] = await db.execute(
       `
-      SELECT users.id, users.username, users.role
+      SELECT
+        users.id,
+        users.username,
+        users.role,
+        users.profile_image_base64,
+        users.secondary_profile_image_base64
       FROM auth_sessions
       JOIN users ON users.id = auth_sessions.user_id
       WHERE auth_sessions.session_token = ?
