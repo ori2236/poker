@@ -73,14 +73,17 @@ async function getMyDailySummary(req, res) {
     const [rows] = await db.execute(
       `
       SELECT
-        DATE(created_at) AS date,
-        COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount ELSE 0 END), 0) AS total_in,
-        COALESCE(SUM(CASE WHEN direction = 'DEBIT' THEN amount ELSE 0 END), 0) AS total_out,
-        COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount WHEN direction = 'DEBIT' THEN -amount ELSE 0 END), 0) AS net
-      FROM balance_transactions
-      WHERE user_id = ?
-      GROUP BY DATE(created_at)
-      ORDER BY DATE(created_at) DESC
+        DATE(COALESCE(gs.ended_at, bt.created_at)) AS date,
+        COALESCE(SUM(CASE WHEN bt.direction = 'CREDIT' THEN bt.amount ELSE 0 END), 0) AS total_in,
+        COALESCE(SUM(CASE WHEN bt.direction = 'DEBIT' THEN bt.amount ELSE 0 END), 0) AS total_out,
+        COALESCE(SUM(CASE WHEN bt.direction = 'CREDIT' THEN bt.amount WHEN bt.direction = 'DEBIT' THEN -bt.amount ELSE 0 END), 0) AS net
+      FROM balance_transactions bt
+      LEFT JOIN game_sessions gs
+        ON gs.id = bt.session_id
+       AND gs.status = 'ENDED'
+      WHERE bt.user_id = ?
+      GROUP BY DATE(COALESCE(gs.ended_at, bt.created_at))
+      ORDER BY DATE(COALESCE(gs.ended_at, bt.created_at)) DESC
       `,
       [userId],
     );

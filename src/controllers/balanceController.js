@@ -29,16 +29,20 @@ async function getMyBalance(req, res) {
 
     const [todayRows] = await db.execute(
       `
-      SELECT 
+      SELECT
         COALESCE(SUM(
-          CASE 
-            WHEN direction = 'CREDIT' THEN amount
-            WHEN direction = 'DEBIT' THEN -amount
+          CASE
+            WHEN bt.direction = 'CREDIT' THEN bt.amount
+            WHEN bt.direction = 'DEBIT' THEN -bt.amount
             ELSE 0
           END
         ), 0) AS today_net
-      FROM balance_transactions
-      WHERE user_id = ? AND DATE(created_at) = CURDATE()
+      FROM balance_transactions bt
+      LEFT JOIN game_sessions gs
+        ON gs.id = bt.session_id
+       AND gs.status = 'ENDED'
+      WHERE bt.user_id = ?
+        AND DATE(COALESCE(gs.ended_at, bt.created_at)) = CURDATE()
       `,
       [userId],
     );
@@ -78,14 +82,17 @@ async function getLeaderboard(req, res) {
         ), 0) AS balance,
         COALESCE(SUM(
           CASE 
-            WHEN DATE(bt.created_at) = CURDATE() AND bt.direction = 'CREDIT' THEN bt.amount
-            WHEN DATE(bt.created_at) = CURDATE() AND bt.direction = 'DEBIT' THEN -bt.amount
+            WHEN DATE(COALESCE(gs.ended_at, bt.created_at)) = CURDATE() AND bt.direction = 'CREDIT' THEN bt.amount
+            WHEN DATE(COALESCE(gs.ended_at, bt.created_at)) = CURDATE() AND bt.direction = 'DEBIT' THEN -bt.amount
             ELSE 0
           END
         ), 0) AS today_net,
         COALESCE(MAX(bt.created_at), u.created_at) AS balance_held_since
       FROM users u
       LEFT JOIN balance_transactions bt ON bt.user_id = u.id
+      LEFT JOIN game_sessions gs
+        ON gs.id = bt.session_id
+       AND gs.status = 'ENDED'
       WHERE u.is_active = 1
       GROUP BY 
         u.id,

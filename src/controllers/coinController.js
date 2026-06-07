@@ -9,6 +9,18 @@ function toNumber(value) {
   return Number(value || 0);
 }
 
+function parseImageBase64(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  const dataUriMatch = raw.match(/^data:([^;]+);base64,(.+)$/);
+  if (dataUriMatch) {
+    return { mime: dataUriMatch[1], base64: dataUriMatch[2] };
+  }
+
+  return { mime: null, base64: raw };
+}
+
 async function ensureMarketRows(connection) {
   await connection.execute(
     `
@@ -153,7 +165,7 @@ function mapCoinRow(row, userId, balance, pendingRequestCoinIds) {
     description: row.description,
     category: row.category,
     image_mime: row.image_mime,
-    image_base64: row.image_base64,
+    image_url: row.has_image ? `/coins/${Number(row.id)}/image` : null,
     sort_order: Number(row.sort_order || 0),
     status: row.status || "AVAILABLE",
     owner_user_id: row.owner_user_id === null ? null : Number(row.owner_user_id),
@@ -216,7 +228,7 @@ async function getCoins(req, res) {
         cc.description,
         cc.category,
         cc.image_mime,
-        cc.image_base64,
+        (cc.image_base64 IS NOT NULL AND cc.image_base64 <> '') AS has_image,
         cc.sort_order,
         cms.status,
         cms.owner_user_id,
@@ -251,6 +263,46 @@ async function getCoins(req, res) {
     res.status(500).json({ message: "Failed to load coins" });
   } finally {
     connection.release();
+  }
+}
+
+async function getCoinImage(req, res) {
+  try {
+    const coinId = Number(req.params.id);
+
+    if (!Number.isInteger(coinId) || coinId <= 0) {
+      return res.status(400).json({ message: "Invalid coin id" });
+    }
+
+    const [rows] = await db.execute(
+      `
+      SELECT image_mime, image_base64
+      FROM coin_catalog
+      WHERE id = ? AND is_active = 1
+      LIMIT 1
+      `,
+      [coinId],
+    );
+
+    if (rows.length === 0 || !rows[0].image_base64) {
+      return res.status(404).json({ message: "Coin image not found" });
+    }
+
+    const parsed = parseImageBase64(rows[0].image_base64);
+
+    if (!parsed?.base64) {
+      return res.status(404).json({ message: "Coin image not found" });
+    }
+
+    const mime = parsed.mime || rows[0].image_mime || "image/png";
+    const buffer = Buffer.from(parsed.base64, "base64");
+
+    res.set("Content-Type", mime);
+    res.set("Cache-Control", "public, max-age=604800, immutable");
+    res.send(buffer);
+  } catch (error) {
+    console.error("getCoinImage error:", error);
+    res.status(500).json({ message: "Failed to load coin image" });
   }
 }
 
@@ -613,6 +665,7 @@ async function requestExclusiveOwnership(req, res) {
 
 module.exports = {
   getCoins,
+  getCoinImage,
   buyCoin,
   listCoinForSale,
   requestExclusiveOwnership,
